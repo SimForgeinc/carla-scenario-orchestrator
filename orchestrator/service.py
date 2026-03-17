@@ -255,26 +255,31 @@ class OrchestratorService:
 
         try:
             result = self.runtime_backend.run_job(runtime_spec, on_event, cancel_event)
-            updates = {
-                "state": result.state,
-                "error": result.error,
-                "run_id": result.run_id,
-                "artifacts": job.artifacts.model_copy(
-                    update={
-                        "manifest_path": result.manifest_path,
-                        "recording_path": result.recording_path,
-                        "scenario_log_path": result.scenario_log_path,
-                        "debug_log_path": result.debug_log_path,
-                    }
-                ),
-            }
-            current = self.store.update(job_id, **updates)
+            local_artifacts = job.artifacts.model_copy(
+                update={
+                    "manifest_path": result.manifest_path,
+                    "recording_path": result.recording_path,
+                    "scenario_log_path": result.scenario_log_path,
+                    "debug_log_path": result.debug_log_path,
+                }
+            )
+            current = self.store.update(
+                job_id,
+                error=result.error,
+                run_id=result.run_id,
+                artifacts=local_artifacts,
+            )
             uploaded_artifacts = self.artifact_storage.upload_job_artifacts(current)
+            final_artifacts = current.artifacts
             if uploaded_artifacts:
-                self.store.update(
-                    job_id,
-                    artifacts=current.artifacts.model_copy(update={"uploaded_artifacts": uploaded_artifacts}),
-                )
+                final_artifacts = current.artifacts.model_copy(update={"uploaded_artifacts": uploaded_artifacts})
+            self.store.update(
+                job_id,
+                state=result.state,
+                error=result.error,
+                run_id=result.run_id,
+                artifacts=final_artifacts,
+            )
         except Exception as exc:  # noqa: BLE001
             final_state = JobState.cancelled if cancel_event.is_set() else JobState.failed
             self.store.update(job_id, state=final_state, error=str(exc))
