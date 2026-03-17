@@ -25,6 +25,7 @@ def make_settings() -> Settings:
         python_executable="python3",
         docker_network_mode="host",
         carla_start_command_template="./CarlaUE4.sh -carla-rpc-port={rpc_port}",
+        utility_backend_base=None,
     )
 
 
@@ -56,6 +57,7 @@ class GpuSchedulerTests(unittest.TestCase):
                 python_executable=settings.python_executable,
                 docker_network_mode=settings.docker_network_mode,
                 carla_start_command_template=settings.carla_start_command_template,
+                utility_backend_base=None,
             )
         )
         first = scheduler.acquire("job-a", threading.Event())
@@ -78,4 +80,3 @@ class GpuSchedulerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

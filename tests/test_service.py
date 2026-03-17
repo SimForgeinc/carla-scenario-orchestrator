@@ -90,6 +90,7 @@ class ServiceTests(unittest.TestCase):
             python_executable="python3",
             docker_network_mode="host",
             carla_start_command_template="./CarlaUE4.sh -carla-rpc-port={rpc_port}",
+            utility_backend_base=None,
         )
         settings.jobs_root.mkdir(parents=True, exist_ok=True)
         return OrchestratorService(settings=settings, runtime_backend=FakeRuntimeBackend())

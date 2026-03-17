@@ -91,6 +91,11 @@ class HealthResponse(BaseModel):
     total_slots: int
     busy_slots: int
     queued_jobs: int
+    carla_connected: bool = False
+    running: bool = False
+    langchain_available: bool = False
+    langsmith_available: bool = False
+    langsmith_tracing: bool = False
 
 
 class CompatibilityRunResponse(BaseModel):
@@ -117,4 +122,3 @@ class RuntimeExecutionResult(BaseModel):
     scenario_log_path: str | None = None
     debug_log_path: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
-

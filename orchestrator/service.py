@@ -21,7 +21,8 @@ from .runtime_backend import DockerRuntimeBackend, RuntimeBackend
 from .scheduler import GpuScheduler
 from .store import JobStore
 from .carla_runner.dataset_repository import list_supported_maps
-from .carla_runner.models import SimulationRunRequest, SimulationStreamMessage
+from .carla_runner.models import RecordingInfo, SimulationRunDiagnostics, SimulationRunRequest, SimulationStreamMessage
+from .utility_proxy import UtilityBackendProxy
 
 
 class OrchestratorService:
@@ -36,6 +37,7 @@ class OrchestratorService:
         self.scheduler = scheduler or GpuScheduler(settings)
         self.store = store or JobStore()
         self.runtime_backend = runtime_backend or DockerRuntimeBackend(settings)
+        self.utility_proxy = UtilityBackendProxy(settings.utility_backend_base)
         self._cancel_events: dict[str, threading.Event] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
@@ -99,10 +101,112 @@ class OrchestratorService:
 
     def health(self) -> HealthResponse:
         capacity = self.scheduler.snapshot()
+        carla_connected = False
+        langchain_available = False
+        langsmith_available = False
+        langsmith_tracing = False
+        if self.utility_proxy.configured():
+            try:
+                utility_health = self.utility_proxy.fetch_json("/api/health")
+                carla_connected = bool(utility_health.get("carla_connected"))
+                langchain_available = bool(utility_health.get("langchain_available"))
+                langsmith_available = bool(utility_health.get("langsmith_available"))
+                langsmith_tracing = bool(utility_health.get("langsmith_tracing"))
+            except Exception:
+                carla_connected = False
         return HealthResponse(
             total_slots=capacity.total_slots,
             busy_slots=capacity.busy_slots,
             queued_jobs=self.store.queued_count(),
+            carla_connected=carla_connected,
+            running=capacity.busy_slots > 0,
+            langchain_available=langchain_available,
+            langsmith_available=langsmith_available,
+            langsmith_tracing=langsmith_tracing,
+        )
+
+    def proxy_json(self, path: str, method: str = "GET", payload: dict | None = None):
+        return self.utility_proxy.fetch_json(path, method=method, payload=payload)
+
+    def proxy_bytes(self, path: str, method: str = "GET", payload: dict | None = None) -> bytes:
+        return self.utility_proxy.fetch_bytes(path, method=method, payload=payload)
+
+    def latest_job(self) -> JobRecord | None:
+        return self.store.latest()
+
+    def latest_running_job(self) -> JobRecord | None:
+        return self.store.latest_running()
+
+    def list_recordings(self) -> list[RecordingInfo]:
+        items: list[RecordingInfo] = []
+        for job in self.store.list():
+            if not job.run_id:
+                continue
+            if not job.artifacts.recording_path:
+                continue
+            items.append(
+                RecordingInfo(
+                    run_id=job.run_id,
+                    label=f"{job.request.map_name} ({job.job_id})",
+                    mp4_path=job.artifacts.recording_path,
+                    frames_path=None,
+                    created_at=job.updated_at.isoformat(),
+                )
+            )
+        items.sort(key=lambda item: item.created_at, reverse=True)
+        return items
+
+    def latest_run_diagnostics(self) -> SimulationRunDiagnostics | None:
+        for job in reversed(self.store.list()):
+            diagnostics = self.job_diagnostics(job.job_id)
+            if diagnostics is not None:
+                return diagnostics
+        return None
+
+    def job_diagnostics(self, identifier: str) -> SimulationRunDiagnostics | None:
+        jobs = self.store.list()
+        for job in jobs:
+            if job.job_id == identifier or job.run_id == identifier:
+                manifest_path = job.artifacts.manifest_path
+                if not manifest_path:
+                    return None
+                return self._read_run_diagnostics(Path(manifest_path))
+        return None
+
+    def cancel_latest_running_job(self) -> CancelJobResponse | None:
+        job = self.latest_running_job()
+        if job is None:
+            return None
+        return self.cancel_job(job.job_id)
+
+    def _read_run_diagnostics(self, manifest_path: Path) -> SimulationRunDiagnostics:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        run_id = manifest_path.parent.name
+        debug_log_path = data.get("debug_log")
+        log_excerpt = ""
+        if debug_log_path:
+            debug_path = Path(debug_log_path)
+            if debug_path.is_file():
+                try:
+                    lines = debug_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    log_excerpt = "\n".join(lines[-80:])
+                except Exception:
+                    log_excerpt = ""
+        return SimulationRunDiagnostics(
+            run_id=run_id,
+            map_name=str(data.get("map_name") or ""),
+            created_at=str(data.get("created_at") or ""),
+            selected_roads=list(data.get("selected_roads") or []),
+            actors=list(data.get("actors") or []),
+            recording_path=data.get("recording_path"),
+            scenario_log_path=data.get("scenario_log"),
+            debug_log_path=debug_log_path,
+            worker_error=data.get("worker_error"),
+            saved_frame_count=int(data.get("saved_frame_count") or 0),
+            sensor_timeout_count=int(data.get("sensor_timeout_count") or 0),
+            last_sensor_frame=data.get("last_sensor_frame"),
+            skipped_actors=list(data.get("skipped_actors") or []),
+            log_excerpt=log_excerpt,
         )
 
     def _run_job(self, job_id: str) -> None:
@@ -184,4 +288,3 @@ class OrchestratorService:
             output_dir=str(job_dir),
             gpu=gpu,
         )
-

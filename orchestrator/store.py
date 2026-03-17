@@ -51,6 +51,26 @@ class JobStore:
         with self._lock:
             return sum(1 for job in self._jobs.values() if job.state == JobState.queued)
 
+    def latest(self) -> JobRecord | None:
+        with self._lock:
+            if not self._queue_order:
+                return None
+            for job_id in reversed(self._queue_order):
+                job = self._jobs.get(job_id)
+                if job is not None:
+                    return job.model_copy(deep=True)
+            return None
+
+    def latest_running(self) -> JobRecord | None:
+        with self._lock:
+            for job_id in reversed(self._queue_order):
+                job = self._jobs.get(job_id)
+                if job is None:
+                    continue
+                if job.state in {JobState.starting, JobState.running}:
+                    return job.model_copy(deep=True)
+            return None
+
     def update_queue_positions(self) -> None:
         queued_ids = self.queued_job_ids()
         with self._lock:
@@ -75,4 +95,3 @@ class JobStore:
             job = job.model_copy(update={"events": events, "updated_at": utc_now()})
             self._jobs[job_id] = job
             return job.model_copy(deep=True)
-

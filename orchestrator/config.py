@@ -25,6 +25,7 @@ class Settings:
     python_executable: str
     docker_network_mode: str
     carla_start_command_template: str
+    utility_backend_base: str | None
 
     @classmethod
     def load(cls) -> "Settings":
@@ -51,5 +52,5 @@ class Settings:
                 "ORCH_CARLA_START_COMMAND",
                 "./CarlaUE4.sh -RenderOffScreen -nosound -carla-rpc-port={rpc_port}",
             ),
+            utility_backend_base=(os.environ.get("ORCH_UTILITY_BACKEND_BASE") or "").strip() or None,
         )
-
