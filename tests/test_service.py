@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from orchestrator.config import Settings
-from orchestrator.models import JobState, RuntimeExecutionResult, RuntimeLaunchSpec
+from orchestrator.models import JobState, RuntimeExecutionResult, RuntimeLaunchSpec, StoredArtifact
 from orchestrator.service import OrchestratorService
 from orchestrator.carla_runner.models import (
     ActorDraft,
@@ -54,6 +54,28 @@ class FakeRuntimeBackend:
         )
 
 
+class FakeArtifactStorage:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def upload_job_artifacts(self, job):
+        self.calls.append(job.job_id)
+        return [
+            StoredArtifact(
+                kind="MP4",
+                label="recording.mp4",
+                local_path=job.artifacts.recording_path,
+                content_type="video/mp4",
+                file_ext="mp4",
+                size_bytes=123,
+                checksum_sha256="abc123",
+                s3_bucket="simcloud-assets-public-test",
+                s3_key=f"runs/{job.request.source_run_id or job.job_id}/executions/{job.job_id}/recording.mp4",
+                s3_uri=f"s3://simcloud-assets-public-test/runs/{job.request.source_run_id or job.job_id}/executions/{job.job_id}/recording.mp4",
+            )
+        ]
+
+
 def sample_request() -> SimulationRunRequest:
     return SimulationRunRequest(
         map_name="Town10HD_Opt",
@@ -74,7 +96,7 @@ def sample_request() -> SimulationRunRequest:
 
 
 class ServiceTests(unittest.TestCase):
-    def make_service(self, gpu_devices=("0", "1")) -> OrchestratorService:
+    def make_service(self, gpu_devices=("0", "1"), artifact_storage=None) -> OrchestratorService:
         temp_dir = Path(tempfile.mkdtemp(prefix="carla-orchestrator-tests-"))
         settings = Settings(
             repo_root=temp_dir,
@@ -91,9 +113,16 @@ class ServiceTests(unittest.TestCase):
             docker_network_mode="host",
             carla_start_command_template="./CarlaUE4.sh -carla-rpc-port={rpc_port}",
             utility_backend_base=None,
+            storage_bucket="simcloud-assets-public-test",
+            storage_region="us-east-1",
+            storage_prefix="runs",
         )
         settings.jobs_root.mkdir(parents=True, exist_ok=True)
-        return OrchestratorService(settings=settings, runtime_backend=FakeRuntimeBackend())
+        return OrchestratorService(
+            settings=settings,
+            runtime_backend=FakeRuntimeBackend(),
+            artifact_storage=artifact_storage or FakeArtifactStorage(),
+        )
 
     def test_submit_job_runs_to_completion(self) -> None:
         service = self.make_service()
@@ -110,6 +139,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(job.gpu.device_id if job.gpu else None, "0")
         self.assertEqual(len(job.events), 2)
         self.assertTrue(job.artifacts.recording_path.endswith("recording.mp4"))
+        self.assertEqual(len(job.artifacts.uploaded_artifacts), 1)
+        self.assertTrue(job.artifacts.uploaded_artifacts[0].s3_uri.endswith("recording.mp4"))
 
     def test_cancel_queued_job_marks_it_cancelled(self) -> None:
         blocker = threading.Event()

@@ -125,6 +125,7 @@ class SceneAssistantResponse(BaseModel):
 
 
 class SimulationRunRequest(BaseModel):
+    source_run_id: str | None = None
     map_name: str
     selected_roads: list[SelectedRoad] = Field(default_factory=list)
     actors: list[ActorDraft] = Field(default_factory=list)

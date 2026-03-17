@@ -26,6 +26,9 @@ def make_settings() -> Settings:
         docker_network_mode="host",
         carla_start_command_template="./CarlaUE4.sh -carla-rpc-port={rpc_port}",
         utility_backend_base=None,
+        storage_bucket=None,
+        storage_region="us-east-1",
+        storage_prefix="runs",
     )
 
 
@@ -58,6 +61,9 @@ class GpuSchedulerTests(unittest.TestCase):
                 docker_network_mode=settings.docker_network_mode,
                 carla_start_command_template=settings.carla_start_command_template,
                 utility_backend_base=None,
+                storage_bucket=None,
+                storage_region="us-east-1",
+                storage_prefix="runs",
             )
         )
         first = scheduler.acquire("job-a", threading.Event())

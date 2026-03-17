@@ -46,6 +46,19 @@ class JobEvent(BaseModel):
     payload: SimulationStreamMessage
 
 
+class StoredArtifact(BaseModel):
+    kind: str
+    label: str | None = None
+    local_path: str | None = None
+    content_type: str | None = None
+    file_ext: str | None = None
+    size_bytes: int | None = None
+    checksum_sha256: str | None = None
+    s3_bucket: str | None = None
+    s3_key: str | None = None
+    s3_uri: str | None = None
+
+
 class JobArtifacts(BaseModel):
     output_dir: str
     request_file: str
@@ -54,6 +67,7 @@ class JobArtifacts(BaseModel):
     recording_path: str | None = None
     scenario_log_path: str | None = None
     debug_log_path: str | None = None
+    uploaded_artifacts: list[StoredArtifact] = Field(default_factory=list)
 
 
 class JobRecord(BaseModel):

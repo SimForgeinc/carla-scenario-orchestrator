@@ -5,6 +5,12 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # pragma: no cover - local fallback when deps are not installed yet
+    def load_dotenv(*args, **kwargs):  # type: ignore[no-redef]
+        return False
+
 
 def _split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
@@ -26,10 +32,14 @@ class Settings:
     docker_network_mode: str
     carla_start_command_template: str
     utility_backend_base: str | None
+    storage_bucket: str | None
+    storage_region: str
+    storage_prefix: str
 
     @classmethod
     def load(cls) -> "Settings":
         repo_root = Path(__file__).resolve().parents[1]
+        load_dotenv(repo_root / ".env", override=False)
         jobs_root = Path(os.environ.get("ORCH_JOBS_ROOT", repo_root / "runs")).resolve()
         jobs_root.mkdir(parents=True, exist_ok=True)
         gpu_devices = tuple(_split_csv(os.environ.get("ORCH_GPU_DEVICES", "0,1,2,3,4,5,6,7")))
@@ -53,4 +63,9 @@ class Settings:
                 "./CarlaUE4.sh -RenderOffScreen -nosound -carla-rpc-port={rpc_port}",
             ),
             utility_backend_base=(os.environ.get("ORCH_UTILITY_BACKEND_BASE") or "").strip() or None,
+            storage_bucket=(os.environ.get("ORCH_STORAGE_BUCKET") or "").strip() or None,
+            storage_region=os.environ.get("ORCH_STORAGE_REGION")
+            or os.environ.get("AWS_REGION")
+            or "us-east-1",
+            storage_prefix=(os.environ.get("ORCH_STORAGE_PREFIX") or "runs").strip("/"),
         )

@@ -5,6 +5,7 @@ import threading
 import uuid
 from pathlib import Path
 
+from .artifact_storage import ArtifactStorage, NullArtifactStorage, S3ArtifactStorage
 from .config import Settings
 from .models import (
     CancelJobResponse,
@@ -32,11 +33,18 @@ class OrchestratorService:
         scheduler: GpuScheduler | None = None,
         store: JobStore | None = None,
         runtime_backend: RuntimeBackend | None = None,
+        artifact_storage: ArtifactStorage | None = None,
     ) -> None:
         self.settings = settings
         self.scheduler = scheduler or GpuScheduler(settings)
         self.store = store or JobStore()
         self.runtime_backend = runtime_backend or DockerRuntimeBackend(settings)
+        if artifact_storage is not None:
+            self.artifact_storage = artifact_storage
+        elif settings.storage_bucket:
+            self.artifact_storage = S3ArtifactStorage(settings)
+        else:
+            self.artifact_storage = NullArtifactStorage()
         self.utility_proxy = UtilityBackendProxy(settings.utility_backend_base)
         self._cancel_events: dict[str, threading.Event] = {}
         self._threads: dict[str, threading.Thread] = {}
@@ -260,7 +268,13 @@ class OrchestratorService:
                     }
                 ),
             }
-            self.store.update(job_id, **updates)
+            current = self.store.update(job_id, **updates)
+            uploaded_artifacts = self.artifact_storage.upload_job_artifacts(current)
+            if uploaded_artifacts:
+                self.store.update(
+                    job_id,
+                    artifacts=current.artifacts.model_copy(update={"uploaded_artifacts": uploaded_artifacts}),
+                )
         except Exception as exc:  # noqa: BLE001
             final_state = JobState.cancelled if cancel_event.is_set() else JobState.failed
             self.store.update(job_id, state=final_state, error=str(exc))

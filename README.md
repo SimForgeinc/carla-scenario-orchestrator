@@ -9,6 +9,7 @@ The design goal is one user request per isolated CARLA runtime:
 - one CARLA Docker container is launched per job
 - one scenario runner subprocess connects to that CARLA instance and executes the scenario
 - artifacts are written under `runs/<job_id>/`
+- generated artifacts can also be pushed to S3 for durable storage
 
 This repo reuses the proven scenario execution worker from `carla-scenario-tool-server`, but removes the singleton service model that only allowed one active simulation at a time.
 
@@ -36,8 +37,19 @@ The important variables are:
 - `ORCH_CARLA_RPC_PORT_BASE=2000`
 - `ORCH_TRAFFIC_MANAGER_PORT_BASE=8000`
 - `ORCH_PORT_STRIDE=100`
+- `ORCH_STORAGE_BUCKET=simcloud-assets-public-test`
+- `ORCH_STORAGE_REGION=us-east-1`
+- `ORCH_STORAGE_PREFIX=runs`
 
 With the defaults, GPU slot `0` uses CARLA RPC `2000` and TM `8000`, slot `1` uses `2100` and `8100`, and so on.
+
+When `ORCH_STORAGE_BUCKET` is set, the orchestrator uploads `manifest.json`, `recording.mp4`, `scenario.log`, and `run.log` to:
+
+```text
+runs/<source_run_id>/executions/<job_id>/<backend_run_id>/
+```
+
+Set `source_run_id` on the submitted simulation request so uploaded artifacts line up with the originating SimCloud run.
 
 ## Run
 
@@ -55,4 +67,3 @@ You still need a matching CARLA Python wheel installed in the same environment f
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
-
