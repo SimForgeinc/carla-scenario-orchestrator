@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from .carla_runner.models import SimulationRunRequest, SimulationStreamMessage
+
+
+class JobState(str, Enum):
+    queued = "queued"
+    starting = "starting"
+    running = "running"
+    succeeded = "succeeded"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class GpuLeaseInfo(BaseModel):
+    slot_index: int
+    device_id: str
+    carla_rpc_port: int
+    traffic_manager_port: int
+
+
+class CapacitySlot(BaseModel):
+    slot_index: int
+    device_id: str
+    busy: bool = False
+    job_id: str | None = None
+    carla_rpc_port: int
+    traffic_manager_port: int
+
+
+class CapacityResponse(BaseModel):
+    total_slots: int
+    busy_slots: int
+    free_slots: int
+    slots: list[CapacitySlot] = Field(default_factory=list)
+
+
+class JobEvent(BaseModel):
+    created_at: datetime
+    payload: SimulationStreamMessage
+
+
+class JobArtifacts(BaseModel):
+    output_dir: str
+    request_file: str
+    runtime_settings_file: str
+    manifest_path: str | None = None
+    recording_path: str | None = None
+    scenario_log_path: str | None = None
+    debug_log_path: str | None = None
+
+
+class JobRecord(BaseModel):
+    job_id: str
+    state: JobState
+    created_at: datetime
+    updated_at: datetime
+    request: SimulationRunRequest
+    queue_position: int = 0
+    gpu: GpuLeaseInfo | None = None
+    container_name: str | None = None
+    error: str | None = None
+    run_id: str | None = None
+    events: list[JobEvent] = Field(default_factory=list)
+    artifacts: JobArtifacts
+
+
+class JobSubmissionResponse(BaseModel):
+    job_id: str
+    state: JobState
+    queue_position: int
+
+
+class JobListResponse(BaseModel):
+    items: list[JobRecord] = Field(default_factory=list)
+
+
+class CancelJobResponse(BaseModel):
+    job_id: str
+    state: JobState
+
+
+class HealthResponse(BaseModel):
+    ok: bool = True
+    total_slots: int
+    busy_slots: int
+    queued_jobs: int
+
+
+class CompatibilityRunResponse(BaseModel):
+    status: str
+    job_id: str
+    state: JobState
+    queue_position: int
+
+
+class RuntimeLaunchSpec(BaseModel):
+    job_id: str
+    request_file: str
+    runtime_settings_file: str
+    output_dir: str
+    gpu: GpuLeaseInfo
+
+
+class RuntimeExecutionResult(BaseModel):
+    state: JobState
+    error: str | None = None
+    run_id: str | None = None
+    manifest_path: str | None = None
+    recording_path: str | None = None
+    scenario_log_path: str | None = None
+    debug_log_path: str | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
+
