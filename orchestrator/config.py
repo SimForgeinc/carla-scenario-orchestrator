@@ -38,6 +38,7 @@ class Settings:
     storage_bucket: str | None
     storage_region: str
     storage_prefix: str
+    warm_metadata_cache_on_startup: bool = True
 
     @classmethod
     def load(cls) -> "Settings":
@@ -81,6 +82,8 @@ class Settings:
             carla_metadata_host=os.environ.get("ORCH_CARLA_METADATA_HOST", "127.0.0.1"),
             carla_metadata_port=carla_metadata_port,
             carla_metadata_timeout=float(os.environ.get("ORCH_CARLA_METADATA_TIMEOUT", "20")),
+            warm_metadata_cache_on_startup=os.environ.get("ORCH_WARM_METADATA_CACHE_ON_STARTUP", "true").lower()
+            not in {"0", "false", "no"},
             storage_bucket=(os.environ.get("ORCH_STORAGE_BUCKET") or "").strip() or None,
             storage_region=os.environ.get("ORCH_STORAGE_REGION")
             or os.environ.get("AWS_REGION")

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from .config import Settings
 from .models import CancelJobResponse, CompatibilityRunResponse, JobListResponse, JobRecord, JobSubmissionResponse
@@ -89,6 +89,22 @@ async def runtime_map():
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.get("/api/map/xodr")
+async def map_xodr():
+    try:
+        return Response(content=service.map_xodr(), media_type="application/xml")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/map/generated")
+async def map_generated():
+    try:
+        return service.map_generated()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/actors/blueprints")
 async def actor_blueprints():
     try:
@@ -152,10 +168,12 @@ async def job_stream(job_id: str, websocket: WebSocket):
                 await websocket.close(code=4404)
                 return
             new_events = job.events[sent:]
-            for event in new_events:
-                await websocket.send_json(event.payload.model_dump())
-                sent += 1
-            await asyncio.sleep(0.25)
+            if new_events:
+                batch = [event.payload.model_dump() for event in new_events]
+                await websocket.send_json(batch)
+                sent += len(new_events)
+            else:
+                await asyncio.sleep(0.01)
     except WebSocketDisconnect:
         return
 
@@ -212,8 +230,8 @@ async def compatibility_resume(job_id: str | None = Query(default=None)):
 
 
 @app.get("/api/simulation/recordings")
-async def simulation_recordings():
-    return {"items": [item.model_dump() for item in service.list_recordings()]}
+async def simulation_recordings(source_run_id: str | None = Query(default=None)):
+    return {"items": [item.model_dump() for item in service.list_recordings(source_run_id=source_run_id)]}
 
 
 @app.get("/api/simulation/runs/latest")
@@ -231,6 +249,24 @@ async def simulation_run_details(run_id: str):
         raise HTTPException(status_code=404, detail="Simulation run not found.")
     return diagnostics
 
+
+
+
+@app.get('/api/jobs/{job_id}/log')
+async def job_log(job_id: str):
+    log_text = service.get_job_log(job_id)
+    if log_text is None:
+        raise HTTPException(status_code=404, detail='Job or log not found.')
+    return {'log': log_text}
+
+
+@app.get('/api/simulation/log')
+async def simulation_log():
+    job = service.latest_running_job() or service.latest_job()
+    if job is None:
+        return {'log': ''}
+    log_text = service.get_job_log(job.job_id)
+    return {'log': log_text or ''}
 
 @app.get("/api/simulation/recordings/file")
 async def simulation_recording_file(path: str):

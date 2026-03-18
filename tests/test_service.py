@@ -133,6 +133,7 @@ class ServiceTests(unittest.TestCase):
             carla_metadata_host="127.0.0.1",
             carla_metadata_port=2000 + metadata_slot_index * 100,
             carla_metadata_timeout=20,
+            warm_metadata_cache_on_startup=False,
             storage_bucket="simcloud-assets-public-test",
             storage_region="us-east-1",
             storage_prefix="runs",

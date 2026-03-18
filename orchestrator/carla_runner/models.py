@@ -143,12 +143,16 @@ class RecordingInfo(BaseModel):
     mp4_path: str | None = None
     frames_path: str | None = None
     created_at: str
+    source_run_id: str | None = None
+    s3_url: str | None = None
 
 
 class SimulationRunDiagnostics(BaseModel):
     run_id: str
     map_name: str
     created_at: str
+    source_run_id: str | None = None
+    s3_url: str | None = None
     selected_roads: list[SelectedRoad] = Field(default_factory=list)
     actors: list[ActorDraft] = Field(default_factory=list)
     recording_path: str | None = None
@@ -165,7 +169,6 @@ class SimulationRunDiagnostics(BaseModel):
 class CarlaMapInfo(BaseModel):
     name: str
     normalized_name: str
-    supported_in_dataset: bool
 
 
 class CarlaStatusResponse(BaseModel):
@@ -175,7 +178,6 @@ class CarlaStatusResponse(BaseModel):
     server_version: str | None = None
     client_version: str | None = None
     available_maps: list[CarlaMapInfo] = Field(default_factory=list)
-    supported_dataset_maps: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 

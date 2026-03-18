@@ -72,6 +72,8 @@ class OrchestratorService:
 
     def startup(self) -> None:
         self._ensure_runtime_pool_started()
+        if self.settings.warm_metadata_cache_on_startup:
+            threading.Thread(target=self.carla_metadata.warm_cache, daemon=True).start()
 
     def _ensure_runtime_pool_started(self) -> None:
         with self._lock:
@@ -166,6 +168,12 @@ class OrchestratorService:
 
     def runtime_map(self):
         return self.carla_metadata.get_runtime_map()
+
+    def map_xodr(self) -> str:
+        return self.carla_metadata.get_map_xodr()
+
+    def map_generated(self) -> dict[str, object]:
+        return self.carla_metadata.get_generated_map()
 
     def actor_blueprints(self) -> dict[str, list[str]]:
         return self.carla_metadata.list_blueprints()
@@ -266,13 +274,21 @@ class OrchestratorService:
             "waypoints": waypoints,
         }
 
-    def list_recordings(self) -> list[RecordingInfo]:
+    def list_recordings(self, source_run_id: str | None = None) -> list[RecordingInfo]:
         items: list[RecordingInfo] = []
         for job in self.store.list():
             if not job.run_id:
                 continue
             if not job.artifacts.recording_path:
                 continue
+            if source_run_id and getattr(job.request, 'source_run_id', None) != source_run_id:
+                continue
+            # Find S3 URL for the MP4 if uploaded
+            s3_url: str | None = None
+            for artifact in job.artifacts.uploaded_artifacts:
+                if artifact.kind == "MP4" and artifact.s3_key:
+                    s3_url = f"https://{artifact.s3_bucket}.s3.amazonaws.com/{artifact.s3_key}"
+                    break
             items.append(
                 RecordingInfo(
                     run_id=job.run_id,
@@ -280,6 +296,8 @@ class OrchestratorService:
                     mp4_path=job.artifacts.recording_path,
                     frames_path=None,
                     created_at=job.updated_at.isoformat(),
+                    source_run_id=getattr(job.request, 'source_run_id', None),
+                    s3_url=s3_url,
                 )
             )
         items.sort(key=lambda item: item.created_at, reverse=True)
@@ -307,6 +325,22 @@ class OrchestratorService:
         if job is None:
             return None
         return self.cancel_job(job.job_id)
+
+
+    def get_job_log(self, job_id: str) -> str | None:
+        job = self.store.get(job_id)
+        if job is None:
+            return None
+        # Try the debug_log_path from artifacts first (set after run completes)
+        if job.artifacts.debug_log_path:
+            p = Path(job.artifacts.debug_log_path)
+            if p.is_file():
+                return p.read_text(encoding='utf-8', errors='replace')
+        # During a running job, search for run.log in the output directory
+        job_dir = Path(job.artifacts.output_dir)
+        for log_path in job_dir.rglob('run.log'):
+            return log_path.read_text(encoding='utf-8', errors='replace')
+        return ''
 
     def _read_run_diagnostics(self, manifest_path: Path) -> SimulationRunDiagnostics:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))

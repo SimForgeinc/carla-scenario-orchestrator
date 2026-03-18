@@ -13,12 +13,13 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .dataset_repository import build_selected_roads, build_runtime_road_summaries, dataset_lane_type_counts, list_supported_maps, normalize_map_name
+from .dataset_repository import build_selected_roads, build_runtime_road_summaries, dataset_lane_type_counts, normalize_map_name
 from .models import (
     ActorDraft,
     ActorTimelineClip,
@@ -844,30 +845,39 @@ def _apply_path_walker_control(carla: Any, walker: Any, target_location: Any, ta
     return False
 
 
-def _encode_mp4(frames_dir: Path, output_path: Path, fps: int) -> None:
+def _encode_mp4(frames_dir: Path, output_path: Path, fps: int, on_progress: Any = None) -> None:
     png_pattern = str(frames_dir / "%06d.png")
     numbers = sorted(int(path.stem) for path in frames_dir.glob("*.png") if path.stem.isdigit())
     if not numbers:
         raise RuntimeError(f"No frames found in {frames_dir}")
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-start_number",
-            str(numbers[0]),
-            "-framerate",
-            str(max(1, fps)),
-            "-i",
-            png_pattern,
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            str(output_path),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    total_frames = len(numbers)
+    cmd = [
+        "ffmpeg", "-y",
+        "-start_number", str(numbers[0]),
+        "-framerate", str(max(1, fps)),
+        "-i", png_pattern,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        str(output_path),
+    ]
+    if on_progress is not None:
+        cmd.insert(-1, "-progress")
+        cmd.insert(-1, "pipe:1")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        encoded = 0
+        for raw_line in proc.stdout:
+            line = raw_line.strip()
+            if line.startswith("frame="):
+                try:
+                    encoded = int(line.split("=", 1)[1])
+                    on_progress(encoded, total_frames)
+                except (ValueError, IndexError):
+                    pass
+        proc.wait()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+    else:
+        subprocess.run(cmd, check=True, capture_output=True)
 
 
 def _put_message(message_queue: Any, payload: dict[str, Any]) -> None:
@@ -913,6 +923,7 @@ def _simulation_worker(
     last_sensor_frame = None
     worker_error = None
     skipped_actors: list[dict[str, Any]] = []
+    frame_writer_pool = ThreadPoolExecutor(max_workers=2)
     path_vehicle_targets: list[tuple[Any, Any, float]] = []
     path_walker_targets: list[tuple[Any, Any, float]] = []
     timeline_states: dict[str, TimelineActorState] = {}
@@ -1445,7 +1456,8 @@ def _simulation_worker(
             if sensor_queue is not None:
                 try:
                     image = sensor_queue.get(timeout=2.0)
-                    image.save_to_disk(str(frames_dir / f"{image.frame:06d}.png"))
+                    dest = str(frames_dir / f"{image.frame:06d}.png")
+                    frame_writer_pool.submit(image.save_to_disk, dest)
                     saved_frame_count += 1
                     last_sensor_frame = int(image.frame)
                 except queue.Empty:
@@ -1500,7 +1512,7 @@ def _simulation_worker(
                 "kind": "stream",
                 "payload": SimulationStreamMessage(
                     frame=frame,
-                    timestamp=time.time(),
+                    timestamp=step * request.fixed_delta_seconds,
                     actors=[],
                     error=str(exc),
                 ).model_dump(),
@@ -1550,11 +1562,50 @@ def _simulation_worker(
             destroy_handles.extend(actor for _, actor in actors if actor is not None)
             _destroy_carla_handles(client, destroy_handles, debug_log)
 
+        _append_debug_log(debug_log, "Waiting for frame writer pool to finish.")
+        try:
+            frame_writer_pool.shutdown(wait=True)
+        except Exception as exc:  # noqa: BLE001
+            _append_debug_log(debug_log, f"Frame writer pool shutdown error: {exc}")
+
         recording = None
         if frames_dir.exists() and any(frames_dir.glob("*.png")):
             try:
                 fps = int(round(1.0 / request.fixed_delta_seconds))
-                _encode_mp4(frames_dir, recording_path, fps)
+                total_png = len(list(frames_dir.glob("*.png")))
+                _append_debug_log(debug_log, f"Encoding MP4: {total_png} frames at {fps} fps.")
+                _put_message(
+                    message_queue,
+                    {
+                        "kind": "stream",
+                        "payload": SimulationStreamMessage(
+                            frame=frame,
+                            timestamp=request.duration_seconds,
+                            actors=[],
+                            encoding=True,
+                            encoding_total_frames=total_png,
+                            encoding_encoded_frames=0,
+                        ).model_dump(),
+                    },
+                )
+
+                def _on_encode_progress(encoded: int, total: int) -> None:
+                    _put_message(
+                        message_queue,
+                        {
+                            "kind": "stream",
+                            "payload": SimulationStreamMessage(
+                                frame=frame,
+                                timestamp=request.duration_seconds,
+                                actors=[],
+                                encoding=True,
+                                encoding_total_frames=total,
+                                encoding_encoded_frames=encoded,
+                            ).model_dump(),
+                        },
+                    )
+
+                _encode_mp4(frames_dir, recording_path, fps, on_progress=_on_encode_progress)
                 recording = RecordingInfo(
                     run_id=run_id,
                     label=f"{normalize_map_name(request.map_name)} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -1600,7 +1651,7 @@ def _simulation_worker(
                 "kind": "stream",
                 "payload": SimulationStreamMessage(
                     frame=frame,
-                    timestamp=time.time(),
+                    timestamp=request.duration_seconds,
                     actors=[],
                     simulation_ended=True,
                     recording=RecordingInfo.model_validate(recording) if recording else None,
@@ -1696,7 +1747,6 @@ class CarlaSimulationService:
             client = self._client()
             world = client.get_world()
             current_map = world.get_map().name
-            supported = set(list_supported_maps())
             available = []
             for item in client.get_available_maps():
                 normalized = normalize_map_name(item)
@@ -1704,7 +1754,6 @@ class CarlaSimulationService:
                     CarlaMapInfo(
                         name=item,
                         normalized_name=normalized,
-                        supported_in_dataset=normalized in supported,
                     )
                 )
             return CarlaStatusResponse(
@@ -1714,14 +1763,12 @@ class CarlaSimulationService:
                 server_version=client.get_server_version(),
                 client_version=client.get_client_version(),
                 available_maps=available,
-                supported_dataset_maps=sorted(supported),
                 warnings=warnings,
             )
         except Exception as exc:  # noqa: BLE001
             warnings.append(str(exc))
             return CarlaStatusResponse(
                 connected=False,
-                supported_dataset_maps=sorted(list_supported_maps()),
                 warnings=warnings,
             )
 
@@ -1864,7 +1911,7 @@ class CarlaSimulationService:
         if self._stop_event is not None:
             self._stop_requested = True
             self._stop_event.set()
-            threading.Thread(target=self._force_stop_worker_after_timeout, daemon=True).start()
+            threading.Thread(target=self._force_stop_worker_after_timeout, args=(120.0,), daemon=True).start()
 
     def pause(self) -> None:
         if self._pause_event is not None:
@@ -1925,7 +1972,7 @@ class CarlaSimulationService:
         self._publish(
             SimulationStreamMessage(
                 frame=0,
-                timestamp=time.time(),
+                timestamp=0.0,
                 actors=[],
                 error="Simulation was force-stopped after the worker stopped responding.",
                 simulation_ended=True,
@@ -1969,7 +2016,7 @@ class CarlaSimulationService:
             self._publish(
                 SimulationStreamMessage(
                     frame=0,
-                    timestamp=time.time(),
+                    timestamp=0.0,
                     actors=[],
                     simulation_ended=True,
                 )
@@ -1978,7 +2025,7 @@ class CarlaSimulationService:
             self._publish(
                 SimulationStreamMessage(
                     frame=0,
-                    timestamp=time.time(),
+                    timestamp=0.0,
                     actors=[],
                     error=f"Simulation worker exited unexpectedly with code {exit_code}.",
                     simulation_ended=True,

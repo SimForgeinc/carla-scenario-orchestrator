@@ -60,8 +60,8 @@ class DockerRuntimeBackend:
         self._ensure_slot_container(spec.gpu, cancel_event)
         return self._run_worker(spec, on_event, cancel_event)
 
-    def _docker_env_args(self) -> list[str]:
-        return [
+    def _docker_env_args(self, device_id: str | None = None) -> list[str]:
+        args = [
             "-e",
             "NVIDIA_DRIVER_CAPABILITIES=all",
             "-e",
@@ -69,6 +69,10 @@ class DockerRuntimeBackend:
             "-v",
             "/usr/share/vulkan/icd.d/nvidia_icd.json:/usr/share/vulkan/icd.d/nvidia_icd.json:ro",
         ]
+        if device_id is not None:
+            args.extend(["-e", f"NVIDIA_VISIBLE_DEVICES={device_id}"])
+            args.extend(["-e", f"CUDA_VISIBLE_DEVICES={device_id}"])
+        return args
 
     def _ensure_slot_container(self, slot: GpuLease | object, cancel_event: Event | None = None) -> None:
         container_name = getattr(slot, "container_name")
@@ -91,6 +95,8 @@ class DockerRuntimeBackend:
         container_name = getattr(slot, "container_name")
         device_id = getattr(slot, "device_id")
         command = self.settings.carla_start_command_template.format(rpc_port=rpc_port)
+        # Tell Unreal Engine which GPU adapter to use (required for multi-GPU with --privileged)
+        command += f" -ini:[/Script/Engine.RendererSettings]:r.GraphicsAdapter={device_id}"
         cmd = [
             "docker",
             "run",
@@ -104,7 +110,7 @@ class DockerRuntimeBackend:
             f"device={device_id}",
             "--network",
             self.settings.docker_network_mode,
-            *self._docker_env_args(),
+            *self._docker_env_args(device_id=device_id),
             self.settings.carla_image,
             "/bin/bash",
             "-lc",
