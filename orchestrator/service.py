@@ -24,8 +24,9 @@ from .llm import BedrockScenarioLLM, BedrockSceneAssistant
 from .llm.langchain_support import LANGCHAIN_AVAILABLE, LANGSMITH_AVAILABLE, langsmith_tracing_enabled
 from .runtime_backend import DockerRuntimeBackend, RuntimeBackend
 from .scheduler import GpuScheduler
+from .worker_pool import WorkerPool
 from .store import JobStore
-from .carla_runner.dataset_repository import list_supported_maps
+from .carla_runner.dataset_repository import list_supported_maps, normalize_map_name
 from .carla_runner.models import (
     LLMGenerateRequest,
     LLMGenerateResponse,
@@ -60,19 +61,61 @@ class OrchestratorService:
             self.artifact_storage = S3ArtifactStorage(settings)
         else:
             self.artifact_storage = NullArtifactStorage()
-        metadata_slot = self.scheduler.metadata_slot()
         self.carla_metadata = CarlaMetadataService(
             host=settings.carla_metadata_host,
-            port=metadata_slot.carla_rpc_port,
             timeout=settings.carla_metadata_timeout,
+            slot_resolver=self._resolve_metadata_slot,
         )
-        self._metadata_slot_index = metadata_slot.slot_index
         self.llm = BedrockScenarioLLM()
         self.scene_assistant = BedrockSceneAssistant(carla_metadata=self.carla_metadata)
+        self.worker_pool: WorkerPool | None = None
         self._cancel_events: dict[str, threading.Event] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
         self._runtime_pool_ready = False
+
+    def _resolve_metadata_slot(self, map_name=None):
+        """Find the best idle execution slot for a metadata query.
+
+        Prefers a slot that already has the requested map loaded (zero switch time).
+        Falls back to any idle slot if no map match exists.
+        """
+        from .carla_metadata import SlotInfo
+        from .carla_runner.dataset_repository import normalize_map_name
+
+        target = normalize_map_name(map_name) if map_name else None
+        snapshot = self.scheduler.snapshot()
+
+        best_idle = None
+        best_match = None
+
+        for slot in snapshot.slots:
+            if slot.role != "execution":
+                continue
+            if slot.status != "ready":
+                continue
+            # Prefer idle slots, but allow busy slots as last resort
+            # (CARLA can handle read-only queries even during simulation)
+            slot_info = SlotInfo(
+                slot_index=slot.slot_index,
+                port=slot.carla_rpc_port,
+                current_map=slot.current_map,
+                busy=slot.busy,
+            )
+            if not slot.busy:
+                if best_idle is None:
+                    best_idle = slot_info
+                if target and slot.current_map and normalize_map_name(slot.current_map) == target:
+                    best_match = slot_info
+
+        # Priority: idle + map match > idle > any match > None
+        if best_match and not best_match.busy:
+            return best_match
+        if best_idle:
+            return best_idle
+        if best_match:
+            return best_match
+        return None
 
     def startup(self) -> None:
         self._ensure_runtime_pool_started()
@@ -84,7 +127,25 @@ class OrchestratorService:
             if self._runtime_pool_ready:
                 return
             self.runtime_backend.initialize_pool(self.scheduler)
+            # Start persistent worker pool (Temporal-based)
+            # Worker processes start immediately (they have their own event loops)
+            # The Temporal client connection is async, so we start it in a background thread
+            import asyncio as _asyncio
+            self.worker_pool = WorkerPool(self.settings, self.scheduler)
+            _loop = _asyncio.new_event_loop()
+            _t = threading.Thread(target=lambda: _loop.run_until_complete(self.worker_pool.start()), daemon=True)
+            _t.start()
+            _t.join(timeout=60)  # Wait for Temporal connection + worker starts
             self._runtime_pool_ready = True
+            # Start periodic worker health check
+            import threading as _threading
+            def _health_check_loop():
+                import time as _time
+                while True:
+                    _time.sleep(30)
+                    if self.worker_pool:
+                        self.worker_pool.check_workers()
+            _threading.Thread(target=_health_check_loop, daemon=True, name="worker-health").start()
 
     def submit_job(self, request: SimulationRunRequest) -> JobSubmissionResponse:
         self._ensure_runtime_pool_started()
@@ -138,7 +199,8 @@ class OrchestratorService:
 
     def health(self) -> HealthResponse:
         capacity = self.scheduler.snapshot()
-        metadata_connected = capacity.metadata_ready
+        # When no dedicated metadata slot, check if any execution slot is ready
+        metadata_connected = capacity.metadata_ready if capacity.metadata_slots > 0 else capacity.ready_slots > 0
         overall_status = "healthy" if capacity.unavailable_slots == 0 and metadata_connected else "degraded"
         return HealthResponse(
             status=overall_status,
@@ -296,7 +358,7 @@ class OrchestratorService:
         with self._lock:
             cancel_event = self._cancel_events[job_id]
         try:
-            lease = self.scheduler.acquire(job_id, cancel_event)
+            lease = self.scheduler.acquire(job_id, cancel_event, map_name=normalize_map_name(job.request.map_name))
         except RuntimeError as exc:
             current = self.store.get(job_id)
             if current is not None and current.state == JobState.cancelled:
@@ -326,7 +388,26 @@ class OrchestratorService:
                 self.store.update(job_id, **updates)
 
         try:
-            result = self.runtime_backend.run_job(runtime_spec, on_event, cancel_event)
+            # Use persistent worker pool instead of subprocess
+            runtime_settings = {
+                "carla_host": "127.0.0.1",
+                "carla_port": lease.carla_rpc_port,
+                "carla_timeout": self.settings.carla_timeout_seconds,
+                "tm_port": lease.traffic_manager_port,
+                "output_root": str(Path(job.artifacts.output_dir)),
+            }
+            import asyncio as _asyncio
+            _loop = _asyncio.new_event_loop()
+            try:
+                result = _loop.run_until_complete(self.worker_pool.dispatch_job(
+                    slot_index=lease.slot_index,
+                    job_id=job_id,
+                    request_payload=job.request.model_dump(),
+                    runtime_settings=runtime_settings,
+                    on_event=on_event,
+                ))
+            finally:
+                _loop.close()
             local_artifacts = job.artifacts.model_copy(
                 update={
                     "manifest_path": result.manifest_path,
@@ -342,6 +423,9 @@ class OrchestratorService:
                 artifacts=local_artifacts,
             )
             uploaded_artifacts = self.artifact_storage.upload_job_artifacts(current)
+            # S3-first: upload everything and delete local directory
+            if hasattr(self.artifact_storage, 'upload_all_and_delete_local'):
+                self.artifact_storage.upload_all_and_delete_local(current)
             final_artifacts = current.artifacts
             if uploaded_artifacts:
                 final_artifacts = current.artifacts.model_copy(update={"uploaded_artifacts": uploaded_artifacts})
@@ -356,6 +440,15 @@ class OrchestratorService:
             final_state = JobState.cancelled if cancel_event.is_set() else JobState.failed
             self.store.update(job_id, state=final_state, error=str(exc))
         finally:
+            # Track which map the slot has loaded after job completion
+            try:
+                import carla as _carla_mod
+                _client = _carla_mod.Client("127.0.0.1", lease.carla_rpc_port)
+                _client.set_timeout(5.0)
+                _actual_map = normalize_map_name(_client.get_world().get_map().name)
+                self.scheduler.set_slot_map(lease.slot_index, _actual_map)
+            except Exception:
+                pass  # dont block release if CARLA is unreachable
             self.scheduler.release(job_id)
             self.store.update_queue_positions()
             self._fire_webhook(job_id)

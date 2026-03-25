@@ -55,13 +55,13 @@ class Settings:
         carla_rpc_port_base = int(os.environ.get("ORCH_CARLA_RPC_PORT_BASE", "2000"))
         traffic_manager_port_base = int(os.environ.get("ORCH_TRAFFIC_MANAGER_PORT_BASE", "8000"))
         port_stride = int(os.environ.get("ORCH_PORT_STRIDE", "100"))
-        default_metadata_slot_index = len(gpu_devices) - 1
+        default_metadata_slot_index = -1  # No dedicated metadata slot; all slots serve both
         metadata_slot_index = int(os.environ.get("ORCH_METADATA_SLOT_INDEX", str(default_metadata_slot_index)))
-        if metadata_slot_index < 0 or metadata_slot_index >= len(gpu_devices):
+        if metadata_slot_index >= len(gpu_devices):
             raise RuntimeError(
-                f"ORCH_METADATA_SLOT_INDEX must be between 0 and {len(gpu_devices) - 1}."
+                f"ORCH_METADATA_SLOT_INDEX must be -1 (disabled) or between 0 and {len(gpu_devices) - 1}."
             )
-        carla_metadata_port = carla_rpc_port_base + metadata_slot_index * port_stride
+        carla_metadata_port = carla_rpc_port_base + max(0, metadata_slot_index) * port_stride
 
         return cls(
             repo_root=repo_root,

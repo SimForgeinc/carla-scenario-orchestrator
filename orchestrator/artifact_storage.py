@@ -88,6 +88,45 @@ class S3ArtifactStorage:
             )
         return uploaded
 
+
+    def upload_all_and_delete_local(self, job: JobRecord) -> list[StoredArtifact]:
+        """Upload all job artifacts to S3, then delete the entire local job directory."""
+        import logging
+        import shutil
+        log = logging.getLogger(__name__)
+
+        # First do the standard upload
+        uploaded = self.upload_job_artifacts(job)
+
+        # Also upload any remaining files in the job directory
+        job_dir = Path(job.artifacts.output_dir)
+        if job_dir.is_dir():
+            prefix = self._key_prefix(job)
+            already_uploaded = {a.local_path for a in uploaded}
+            for file_path in job_dir.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                if str(file_path) in already_uploaded:
+                    continue
+                # Skip very large frame directories (individual JPEGs)
+                if file_path.suffix.lower() in ('.jpg', '.jpeg', '.png') and 'ego_camera_frames' in str(file_path):
+                    continue
+                rel = file_path.relative_to(job_dir)
+                key = f"{prefix}/{rel}"
+                try:
+                    self.client.upload_file(str(file_path), self.bucket, key)
+                except Exception as exc:
+                    log.warning(f"Failed to upload {file_path}: {exc}")
+
+            # Delete local directory
+            try:
+                shutil.rmtree(job_dir)
+                log.info(f"Deleted local job dir: {job_dir}")
+            except Exception as exc:
+                log.warning(f"Failed to delete {job_dir}: {exc}")
+
+        return uploaded
+
     def _key_prefix(self, job: JobRecord) -> str:
         source_run_id = _safe_segment(job.request.source_run_id or job.run_id or job.job_id)
         run_id = _safe_segment(job.run_id or "pending-run")

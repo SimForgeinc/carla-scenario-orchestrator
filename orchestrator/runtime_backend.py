@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import select
 import signal
@@ -15,6 +16,8 @@ from .config import Settings
 from .models import JobState, RuntimeExecutionResult, RuntimeLaunchSpec
 from .carla_runner.models import SimulationStreamMessage
 from .scheduler import GpuLease, GpuScheduler
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeBackend(Protocol):
@@ -50,6 +53,37 @@ class DockerRuntimeBackend:
                 scheduler.mark_slot_unhealthy(slot.slot_index, str(exc))
             else:
                 scheduler.mark_slot_ready(slot.slot_index)
+        # Pre-warm Traffic Manager on each execution slot to avoid 4s cold start per job
+        self._warm_traffic_managers(scheduler)
+
+    def _warm_traffic_managers(self, scheduler: GpuScheduler) -> None:
+        """Connect to each ready execution slot and initialize the Traffic Manager.
+        First TM init per CARLA instance takes ~4s. Subsequent calls are instant."""
+        import threading
+        def _warm_slot(slot: GpuLease) -> None:
+            try:
+                import carla
+                client = carla.Client("127.0.0.1", slot.carla_rpc_port)
+                client.set_timeout(10.0)
+                # TM NOT pre-warmed — would bind the port and block simulation_service.
+                # Track current map only.
+                from .carla_runner.dataset_repository import normalize_map_name
+                current_map = normalize_map_name(client.get_world().get_map().name)
+                scheduler.set_slot_map(slot.slot_index, current_map)
+                logger.info(f"Slot {slot.slot_index}: TM warmed, map={current_map}")
+            except Exception as exc:
+                logger.warning(f"Slot {slot.slot_index}: TM warm failed: {exc}")
+        threads = []
+        for slot in scheduler.slots():
+            if slot.role != "execution":
+                continue
+            if scheduler.get_slot_map(slot.slot_index) is not None:
+                continue  # already tracked
+            t = threading.Thread(target=_warm_slot, args=(slot,), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=15.0)
 
     def run_job(
         self,

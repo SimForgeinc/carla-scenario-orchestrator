@@ -25,6 +25,7 @@ class GpuLeaseInfo(BaseModel):
     container_name: str
     carla_rpc_port: int
     traffic_manager_port: int
+    current_map: str | None = None
 
 
 class CapacitySlot(BaseModel):
@@ -38,6 +39,7 @@ class CapacitySlot(BaseModel):
     status_error: str | None = None
     carla_rpc_port: int
     traffic_manager_port: int
+    current_map: str | None = None
 
 
 class CapacityResponse(BaseModel):

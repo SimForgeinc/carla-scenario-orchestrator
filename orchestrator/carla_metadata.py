@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from collections import defaultdict
-from typing import Any
+from typing import Any, Callable
 
 from .carla_runner.dataset_repository import (
     build_runtime_road_summaries,
@@ -82,18 +82,41 @@ def _drivable_adjacent_lane_id(waypoint: Any, side: str) -> int | None:
     return int(getattr(candidate, "lane_id", 0))
 
 
+class SlotInfo:
+    """Lightweight info about an execution slot for metadata routing."""
+    def __init__(self, slot_index: int, port: int, current_map: str | None, busy: bool):
+        self.slot_index = slot_index
+        self.port = port
+        self.current_map = current_map
+        self.busy = busy
+
+
 class CarlaMetadataService:
-    """Read-only CARLA client for metadata queries (status, maps, blueprints)."""
+    """Read-only CARLA metadata queries, distributed across execution slots.
+
+    Instead of connecting to a dedicated metadata GPU, routes queries to
+    whichever execution slot already has the requested map loaded. This
+    avoids costly map switches and allows all GPUs to serve simulations.
+
+    Architecture:
+      Query arrives (e.g. get_runtime_map for VW_Poc)
+        → _resolve_slot("VW_Poc") finds idle slot with VW_Poc loaded
+        → Creates temporary carla.Client to that slot's port
+        → Executes query, returns result
+        → Slot is never "acquired" — just borrowed for a read-only query
+    """
 
     def __init__(
         self,
         host: str | None = None,
         port: int | None = None,
         timeout: float | None = None,
+        slot_resolver: Callable[[str | None], SlotInfo | None] | None = None,
     ) -> None:
         self.host = host or os.environ.get("ORCH_CARLA_METADATA_HOST", "127.0.0.1")
-        self.port = port or int(os.environ.get("ORCH_CARLA_METADATA_PORT", "2000"))
+        self.default_port = port or int(os.environ.get("ORCH_CARLA_METADATA_PORT", "2000"))
         self.timeout = timeout or float(os.environ.get("ORCH_CARLA_METADATA_TIMEOUT", "20"))
+        self._slot_resolver = slot_resolver
         self._status_cache_ttl = float(
             os.environ.get("ORCH_CARLA_STATUS_CACHE_TTL", str(_STATUS_CACHE_TTL_SECONDS))
         )
@@ -105,9 +128,27 @@ class CarlaMetadataService:
         self._map_xodr_cache: dict[str, str] = {}
         self._generated_map_cache: dict[str, dict[str, Any]] = {}
         self._last_xodr_map_name: str | None = None
+        # Track which map was last requested (for implicit map context)
+        self._current_map_name: str | None = None
 
-    def _client(self) -> Any:
-        return _make_client(self.host, self.port, self.timeout)
+    def set_current_map(self, map_name: str) -> None:
+        """Set the current map context (called when user switches maps in the editor)."""
+        self._current_map_name = normalize_map_name(map_name)
+
+    def _resolve_port(self, map_name: str | None = None) -> int:
+        """Find the best slot port for the given map. Falls back to default_port."""
+        if self._slot_resolver is None:
+            return self.default_port
+
+        target = map_name or self._current_map_name
+        slot = self._slot_resolver(target)
+        if slot is not None:
+            return slot.port
+        return self.default_port
+
+    def _client(self, map_name: str | None = None) -> Any:
+        port = self._resolve_port(map_name)
+        return _make_client(self.host, port, self.timeout)
 
     def _invalidate_status_cache(self) -> None:
         with self._lock:
@@ -127,6 +168,9 @@ class CarlaMetadataService:
             return status.model_copy(deep=True)
 
     def _get_cached_current_map_name(self) -> str | None:
+        # Prefer the explicitly set current map
+        if self._current_map_name:
+            return self._current_map_name
         cached = self._get_status_cache()
         return cached.current_map if cached and cached.connected else None
 
@@ -194,7 +238,7 @@ class CarlaMetadataService:
         except Exception as exc:  # noqa: BLE001
             logger.warning("CARLA metadata connection failed: %s", exc)
             if stale_cached is not None:
-                warning_message = f"Returning cached CARLA metadata after refresh failure: {exc}"
+                warning_message = "Returning cached CARLA metadata after refresh failure: %s" % exc
                 return stale_cached.model_copy(
                     deep=True,
                     update={"warnings": [*stale_cached.warnings, warning_message]},
@@ -206,23 +250,32 @@ class CarlaMetadataService:
             )
 
     def load_map(self, map_name: str) -> CarlaStatusResponse:
-        client = self._client()
-        current = client.get_world().get_map().name
-        if normalize_map_name(current) != normalize_map_name(map_name):
+        """Load a map. Routes to a slot that already has it, or picks any idle slot."""
+        normalized = normalize_map_name(map_name)
+
+        # Try to find a slot that already has this map
+        client = self._client(map_name=normalized)
+        world = client.get_world()
+        current = world.get_map().name
+
+        if normalize_map_name(current) != normalized:
+            # The resolved slot doesn't have this map — need to load it
             client.load_world(map_name)
             time.sleep(1.0)
+
+        self._current_map_name = normalized
         self._invalidate_status_cache()
         return self.get_status(force_refresh=True)
 
     def get_runtime_map(self, force_refresh: bool = False) -> RuntimeMapResponse:
-        cached_map_name = normalize_map_name(self._get_cached_current_map_name() or "")
-        if cached_map_name and not force_refresh:
+        target_map = self._current_map_name
+        if target_map and not force_refresh:
             with self._lock:
-                cached_runtime = self._runtime_map_cache.get(cached_map_name)
+                cached_runtime = self._runtime_map_cache.get(target_map)
             if cached_runtime is not None:
                 return cached_runtime.model_copy(deep=True)
 
-        client = self._client()
+        client = self._client(map_name=target_map)
         world = client.get_world()
         map_name = world.get_map().name
         normalized_map_name = normalize_map_name(map_name)
@@ -269,7 +322,7 @@ class CarlaMetadataService:
                 lane_type_counts[lane_type.lower()] += 1
                 segments.append(
                     RuntimeRoadSegment(
-                        id=f"road-{road_id}-section-{section_id}-lane-{lane_id}",
+                        id="road-%d-section-%d-lane-%d" % (road_id, section_id, lane_id),
                         road_id=road_id,
                         section_id=section_id,
                         lane_id=lane_id,
@@ -296,20 +349,14 @@ class CarlaMetadataService:
         return runtime_map.model_copy(deep=True)
 
     def get_map_xodr(self, force_refresh: bool = False) -> str:
-        cached_map_name = normalize_map_name(self._get_cached_current_map_name() or "")
-        if cached_map_name and not force_refresh:
+        target_map = self._current_map_name
+        if target_map and not force_refresh:
             with self._lock:
-                cached_xodr = self._map_xodr_cache.get(cached_map_name)
-            if cached_xodr is not None:
-                return cached_xodr
-        if not cached_map_name and not force_refresh:
-            with self._lock:
-                last_cached_map_name = self._last_xodr_map_name
-                cached_xodr = self._map_xodr_cache.get(last_cached_map_name or "")
+                cached_xodr = self._map_xodr_cache.get(target_map)
             if cached_xodr is not None:
                 return cached_xodr
 
-        client = self._client()
+        client = self._client(map_name=target_map)
         world = client.get_world()
         map_name = world.get_map().name
         normalized_map_name = normalize_map_name(map_name)
@@ -326,20 +373,14 @@ class CarlaMetadataService:
         return xodr_text
 
     def get_generated_map(self, force_refresh: bool = False) -> dict[str, Any]:
-        cached_map_name = normalize_map_name(self._get_cached_current_map_name() or "")
-        if cached_map_name and not force_refresh:
+        target_map = self._current_map_name
+        if target_map and not force_refresh:
             with self._lock:
-                cached_generated = self._generated_map_cache.get(cached_map_name)
-            if cached_generated is not None:
-                return copy.deepcopy(cached_generated)
-        if not cached_map_name and not force_refresh:
-            with self._lock:
-                last_cached_map_name = self._last_xodr_map_name
-                cached_generated = self._generated_map_cache.get(last_cached_map_name or "")
+                cached_generated = self._generated_map_cache.get(target_map)
             if cached_generated is not None:
                 return copy.deepcopy(cached_generated)
 
-        client = self._client()
+        client = self._client(map_name=target_map)
         world = client.get_world()
         map_name = world.get_map().name
         normalized_map_name = normalize_map_name(map_name)
@@ -387,7 +428,8 @@ class CarlaMetadataService:
         if cached is not None:
             return {kind: list(items) for kind, items in cached.items()}
 
-        client = self._client()
+        # Blueprints are the same across all maps — use any available slot
+        client = self._client(map_name=None)
         world = client.get_world()
         blueprint_library = world.get_blueprint_library()
         blueprints = {

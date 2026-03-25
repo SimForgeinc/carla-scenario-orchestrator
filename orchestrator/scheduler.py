@@ -35,9 +35,11 @@ class GpuScheduler:
         self._slots: list[GpuLease] = []
         self._slot_status: dict[int, str] = {}
         self._slot_errors: dict[int, str | None] = {}
+        self._slot_map: dict[int, str | None] = {}
+        self._slot_last_released: dict[int, float] = {}
         self._metadata_slot_index = settings.metadata_slot_index
         for idx, device_id in enumerate(settings.gpu_devices):
-            role = "metadata" if idx == self._metadata_slot_index else "execution"
+            role = "metadata" if (self._metadata_slot_index >= 0 and idx == self._metadata_slot_index) else "execution"
             container_name = (
                 f"{settings.carla_container_prefix}-metadata".lower()
                 if role == "metadata"
@@ -54,6 +56,8 @@ class GpuScheduler:
             self._slots.append(slot)
             self._slot_status[idx] = "ready"
             self._slot_errors[idx] = None
+            self._slot_map[idx] = None
+            self._slot_last_released[idx] = 0.0  # All start equally idle
 
     def slots(self) -> list[GpuLease]:
         with self._condition:
@@ -61,7 +65,13 @@ class GpuScheduler:
 
     def metadata_slot(self) -> GpuLease:
         with self._condition:
-            return self._slots[self._metadata_slot_index]
+            if self._metadata_slot_index >= 0:
+                return self._slots[self._metadata_slot_index]
+            # No dedicated metadata slot — return first execution slot
+            for slot in self._slots:
+                if slot.role == "execution":
+                    return slot
+            return self._slots[0]
 
     def metadata_status(self) -> tuple[str, str | None]:
         with self._condition:
@@ -85,11 +95,26 @@ class GpuScheduler:
             self._slot_errors[slot_index] = error
             self._condition.notify_all()
 
-    def acquire(self, job_id: str, cancel_event: threading.Event) -> GpuLease:
+    def set_slot_map(self, slot_index: int, map_name: str) -> None:
+        """Update the tracked map for a slot after a job completes."""
+        with self._condition:
+            self._slot_map[slot_index] = map_name
+
+    def get_slot_map(self, slot_index: int) -> str | None:
+        """Get the currently tracked map for a slot."""
+        with self._condition:
+            return self._slot_map.get(slot_index)
+
+    def acquire(self, job_id: str, cancel_event: threading.Event,
+                *, map_name: str | None = None) -> GpuLease:
+        """Acquire a free execution slot, preferring map match + least recently used."""
         with self._condition:
             while True:
                 if cancel_event.is_set():
                     raise RuntimeError("Job cancelled before a GPU slot was assigned.")
+
+                # Collect all free execution slots
+                free_slots: list[GpuLease] = []
                 for slot in self._slots:
                     if slot.role != "execution":
                         continue
@@ -97,17 +122,32 @@ class GpuScheduler:
                         continue
                     if slot.slot_index in self._job_by_slot:
                         continue
-                    self._job_by_slot[slot.slot_index] = job_id
-                    self._leases_by_job[job_id] = slot
-                    return slot
+                    free_slots.append(slot)
+
+                if free_slots:
+                    # Separate into map-matching and non-matching
+                    matching = [s for s in free_slots
+                                if map_name and self._slot_map.get(s.slot_index) == map_name]
+                    candidates = matching if matching else free_slots
+
+                    # Among candidates, pick the one idle longest (LRU)
+                    best = min(candidates,
+                               key=lambda s: self._slot_last_released.get(s.slot_index, 0.0))
+
+                    self._job_by_slot[best.slot_index] = job_id
+                    self._leases_by_job[job_id] = best
+                    return best
+
                 self._condition.wait(timeout=0.5)
 
     def release(self, job_id: str) -> None:
+        import time as _time
         with self._condition:
             lease = self._leases_by_job.pop(job_id, None)
             if lease is None:
                 return
             self._job_by_slot.pop(lease.slot_index, None)
+            self._slot_last_released[lease.slot_index] = _time.time()
             self._condition.notify_all()
 
     def queue_position(self, job_id: str, queued_job_ids: list[str]) -> int:
@@ -133,6 +173,7 @@ class GpuScheduler:
                     status_error=self._slot_errors.get(slot.slot_index),
                     carla_rpc_port=slot.carla_rpc_port,
                     traffic_manager_port=slot.traffic_manager_port,
+                    current_map=self._slot_map.get(slot.slot_index),
                 )
                 slots.append(snapshot_slot)
                 if snapshot_slot.role == "metadata":

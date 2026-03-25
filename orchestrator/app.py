@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -43,6 +44,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CARLA Scenario Orchestrator", lifespan=lifespan)
+
+# Prometheus metrics endpoint at /metrics
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator().instrument(app).expose(app)
+except ImportError:
+    pass
 
 app.add_middleware(
     CORSMiddleware,
@@ -174,6 +182,57 @@ async def cancel_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found.") from exc
 
 
+
+
+class PreloadRequest(BaseModel):
+    map_name: str
+
+@app.post("/api/slots/preload")
+async def preload_map(req: PreloadRequest):
+    """Pre-load a map on an idle slot so the next simulation is instant."""
+    from .carla_runner.dataset_repository import normalize_map_name
+    target_map = normalize_map_name(req.map_name)
+
+    # Check if any slot already has this map
+    capacity = service.capacity()
+    for slot in capacity.slots:
+        if slot.role != "execution":
+            continue
+        if slot.current_map and normalize_map_name(slot.current_map) == target_map:
+            return {"status": "already_loaded", "slot_index": slot.slot_index, "map": slot.current_map}
+
+    # Find an idle slot to preload on
+    for slot in capacity.slots:
+        if slot.role != "execution" or slot.busy or slot.status != "ready":
+            continue
+        # Dispatch preload via worker pool
+        if service.worker_pool:
+            import asyncio
+            asyncio.ensure_future(service.worker_pool.dispatch_preload(slot.slot_index, req.map_name))
+            return {"status": "preloading", "slot_index": slot.slot_index}
+
+    return {"status": "no_idle_slots"}
+
+@app.post("/api/jobs/{job_id}/events")
+async def push_job_event(job_id: str, request: StarletteRequest):
+    """Internal: workers push simulation events here in real-time (single or batch)."""
+    from .carla_runner.models import SimulationStreamMessage
+    from .models import JobState
+    data = await request.json()
+    envelopes = data if isinstance(data, list) else [data]
+    for envelope in envelopes:
+        if envelope.get("kind") == "stream":
+            payload = SimulationStreamMessage.model_validate(envelope.get("payload", {}))
+            service.store.append_event(job_id, payload)
+            job = service.get_job(job_id)
+            if job and job.state == JobState.starting:
+                service.store.update(job_id, state=JobState.running)
+            if payload.error and job and job.state != JobState.cancelled:
+                service.store.update(job_id, error=payload.error)
+            if payload.recording is not None:
+                service.store.update(job_id, run_id=payload.recording.run_id)
+    return {"ok": True}
+
 @app.websocket("/api/jobs/{job_id}/stream")
 async def job_stream(job_id: str, websocket: WebSocket):
     await websocket.accept()
@@ -189,8 +248,13 @@ async def job_stream(job_id: str, websocket: WebSocket):
                 batch = [event.payload.model_dump() for event in new_events]
                 await websocket.send_json(batch)
                 sent += len(new_events)
-            else:
-                await asyncio.sleep(0.01)
+            # Terminate after all events sent for completed jobs
+            if job.state.value in ("succeeded", "failed", "cancelled") and sent >= len(job.events):
+                await websocket.send_json({"stream_complete": True})
+                await websocket.close()
+                return
+            if not new_events:
+                await asyncio.sleep(0.05)
     except WebSocketDisconnect:
         return
 

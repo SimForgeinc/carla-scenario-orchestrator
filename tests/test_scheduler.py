@@ -77,6 +77,114 @@ class GpuSchedulerTests(unittest.TestCase):
         thread.join(timeout=1)
         self.assertEqual(acquired, ["0"])
 
+    # --- Map-aware scheduling tests ---
+
+    def test_prefers_slot_with_matching_map(self) -> None:
+        scheduler = GpuScheduler(make_settings())
+        scheduler.set_slot_map(0, "Town05")
+        scheduler.set_slot_map(1, "VW_Poc")
+        lease = scheduler.acquire("job-a", threading.Event(), map_name="VW_Poc")
+        self.assertEqual(lease.slot_index, 1)
+        scheduler.release("job-a")
+
+    def test_falls_back_when_no_map_match(self) -> None:
+        scheduler = GpuScheduler(make_settings())
+        scheduler.set_slot_map(0, "Town05")
+        scheduler.set_slot_map(1, "Town05")
+        lease = scheduler.acquire("job-a", threading.Event(), map_name="VW_Poc")
+        # Should get first free slot (0) since no match exists
+        self.assertEqual(lease.slot_index, 0)
+        scheduler.release("job-a")
+
+    def test_acquire_without_map_name_backward_compat(self) -> None:
+        scheduler = GpuScheduler(make_settings())
+        scheduler.set_slot_map(0, "Town05")
+        scheduler.set_slot_map(1, "VW_Poc")
+        # No map_name → first free slot
+        lease = scheduler.acquire("job-a", threading.Event())
+        self.assertEqual(lease.slot_index, 0)
+        scheduler.release("job-a")
+
+    def test_map_match_skips_busy_slots(self) -> None:
+        scheduler = GpuScheduler(make_settings())
+        scheduler.set_slot_map(0, "VW_Poc")
+        scheduler.set_slot_map(1, "Town05")
+        # Occupy slot 0 (which has VW_Poc)
+        scheduler.acquire("job-a", threading.Event())
+        # Now request VW_Poc — slot 0 is busy, should get slot 1 (fallback)
+        lease = scheduler.acquire("job-b", threading.Event(), map_name="VW_Poc")
+        self.assertEqual(lease.slot_index, 1)
+        scheduler.release("job-a")
+        scheduler.release("job-b")
+
+    def test_set_and_get_slot_map(self) -> None:
+        scheduler = GpuScheduler(make_settings())
+        self.assertIsNone(scheduler.get_slot_map(0))
+        scheduler.set_slot_map(0, "Town05")
+        self.assertEqual(scheduler.get_slot_map(0), "Town05")
+        self.assertIsNone(scheduler.get_slot_map(1))
+
+    def test_snapshot_includes_current_map(self) -> None:
+        scheduler = GpuScheduler(make_settings())
+        scheduler.set_slot_map(0, "VW_Poc")
+        snapshot = scheduler.snapshot()
+        exec_slots = [s for s in snapshot.slots if s.role == "execution"]
+        self.assertEqual(exec_slots[0].current_map, "VW_Poc")
+        self.assertIsNone(exec_slots[1].current_map)
+
+    def test_map_tracking_persists_across_release(self) -> None:
+        scheduler = GpuScheduler(make_settings())
+        lease = scheduler.acquire("job-a", threading.Event())
+        scheduler.set_slot_map(lease.slot_index, "VW_Poc")
+        scheduler.release("job-a")
+        # Map should still be tracked after release
+        self.assertEqual(scheduler.get_slot_map(lease.slot_index), "VW_Poc")
+        # And next acquire with same map should prefer this slot
+        lease2 = scheduler.acquire("job-b", threading.Event(), map_name="VW_Poc")
+        self.assertEqual(lease2.slot_index, lease.slot_index)
+        scheduler.release("job-b")
+
+
+
+    # --- LRU slot selection tests ---
+
+    def test_lru_distributes_evenly(self) -> None:
+        """Jobs should round-robin across slots, not always pick slot 0."""
+        scheduler = GpuScheduler(make_settings())
+        scheduler.set_slot_map(0, "VW_Poc")
+        scheduler.set_slot_map(1, "VW_Poc")
+
+        slot_counts = {0: 0, 1: 0}
+        for i in range(10):
+            lease = scheduler.acquire(f"job-{i}", threading.Event(), map_name="VW_Poc")
+            slot_counts[lease.slot_index] += 1
+            scheduler.release(f"job-{i}")
+
+        # Both slots should get jobs (not all going to slot 0)
+        self.assertGreater(slot_counts[0], 0)
+        self.assertGreater(slot_counts[1], 0)
+        # Should be roughly even (within 2 of each other)
+        self.assertLessEqual(abs(slot_counts[0] - slot_counts[1]), 2)
+
+    def test_lru_prefers_idle_longest(self) -> None:
+        """Among free matching slots, should pick the one released earliest."""
+        import time
+        scheduler = GpuScheduler(make_settings())
+        scheduler.set_slot_map(0, "VW_Poc")
+        scheduler.set_slot_map(1, "VW_Poc")
+
+        # Acquire both, release slot 1 first, then slot 0
+        scheduler.acquire("job-a", threading.Event())  # gets slot 0
+        scheduler.acquire("job-b", threading.Event())  # gets slot 1
+        scheduler.release("job-b")  # slot 1 released first (earlier timestamp)
+        time.sleep(0.01)
+        scheduler.release("job-a")  # slot 0 released second (later timestamp)
+
+        # Next acquire should pick slot 1 (released earlier = idle longer)
+        lease = scheduler.acquire("job-c", threading.Event(), map_name="VW_Poc")
+        self.assertEqual(lease.slot_index, 1)
+        scheduler.release("job-c")
+
 
 if __name__ == "__main__":
     unittest.main()

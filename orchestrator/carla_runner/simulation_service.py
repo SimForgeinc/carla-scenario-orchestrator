@@ -1029,6 +1029,7 @@ def _simulation_worker(
     message_queue: Any,
     stop_event: Any,
     pause_event: Any,
+    carla_client: Any = None,
 ) -> None:
     request = SimulationRunRequest.model_validate(request_payload)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
@@ -1074,18 +1075,26 @@ def _simulation_worker(
             ),
         )
         carla = _require_carla()
-        client = _make_client(settings["carla_host"], settings["carla_port"], settings["carla_timeout"])
+        if carla_client is not None:
+            client = carla_client
+            _append_debug_log(debug_log, "Reusing persistent CARLA client (no reconnection overhead).")
+        else:
+            client = _make_client(settings["carla_host"], settings["carla_port"], settings["carla_timeout"])
         current = client.get_world().get_map().name
+        _map_load_start = time.time()
         if normalize_map_name(current) != normalize_map_name(request.map_name):
             _append_debug_log(debug_log, f"Loading CARLA map {request.map_name} from {current}.")
             client.load_world(request.map_name)
             time.sleep(1.0)
+        _map_load_elapsed = time.time() - _map_load_start
+        _append_debug_log(debug_log, f"Map load: {_map_load_elapsed:.2f}s (loaded={_map_load_elapsed > 0.1})")
 
         world = client.get_world()
         original_settings = world.get_settings()
         sim_settings = world.get_settings()
         sim_settings.synchronous_mode = True
         sim_settings.fixed_delta_seconds = request.fixed_delta_seconds
+        sim_settings.no_rendering_mode = not request.topdown_recording
         world.apply_settings(sim_settings)
 
         tm = client.get_trafficmanager(settings["tm_port"])
@@ -1687,6 +1696,13 @@ def _simulation_worker(
                 dx = float(target_location.x) - float(loc.x)
                 dy = float(target_location.y) - float(loc.y)
                 distance = math.sqrt(dx * dx + dy * dy)
+                arrived_early = distance <= 3.0 and simulation_time < target_time
+                if arrived_early:
+                    vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+                    if step % 20 == 0:
+                        _append_debug_log(debug_log, f"[TIMED] Holding at wp {wp_index}/{len(waypoints)-1} t={simulation_time:.2f}s until t={target_time:.1f}s dist={distance:.1f}m")
+                    remaining_timed_targets.append(timed_target)
+                    continue
                 desired_speed_mps = min(max_speed_mps, distance / time_remaining)
                 if simulation_time > target_time:
                     desired_speed_mps = max_speed_mps
@@ -1819,11 +1835,15 @@ def _simulation_worker(
         )
     finally:
         _append_debug_log(debug_log, "Finalizing simulation run.")
-        client = None
-        try:
-            client = _make_client(settings["carla_host"], settings["carla_port"], settings["carla_timeout"])
-        except Exception as exc:  # noqa: BLE001
-            _append_debug_log(debug_log, f"Failed to reconnect CARLA client during finalization: {exc}")
+        if carla_client is not None:
+            # Reuse the persistent client for cleanup (don't create a second connection)
+            client = carla_client
+        else:
+            client = None
+            try:
+                client = _make_client(settings["carla_host"], settings["carla_port"], settings["carla_timeout"])
+            except Exception as exc:  # noqa: BLE001
+                _append_debug_log(debug_log, f"Failed to reconnect CARLA client during finalization: {exc}")
 
         if sensor and sensor.is_alive:
             try:
