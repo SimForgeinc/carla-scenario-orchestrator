@@ -81,6 +81,9 @@ class ActorDraft(BaseModel):
     color: str | None = None
     notes: str | None = None
     timed_waypoints: list[TimedWaypoint] = Field(default_factory=list)
+    spawn_yaw: float | None = None
+    path_placement: list[ActorMapPoint] = Field(default_factory=list)
+    path_spacing: float = Field(default=3.0, ge=0.5, le=50.0)
     timeline: list[ActorTimelineClip] = Field(default_factory=list)
 
 

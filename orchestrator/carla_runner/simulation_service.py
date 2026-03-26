@@ -433,10 +433,55 @@ def _location_from_map_point(world: Any, point: Any, z_offset: float = 0.15) -> 
     return carla.Location(x=x, y=y, z=ground_z + z_offset)
 
 
-def _walker_transform_from_points(world: Any, spawn_point: Any, destination_point: Any | None) -> Any:
+def _distribute_along_polyline(points: list, spacing: float) -> list[tuple[float, float, float]]:
+    """Given a polyline of (x, y) points and a spacing distance, return evenly distributed
+    (x, y, yaw_degrees) positions along the line."""
+    import math as _math
+    if len(points) < 2 or spacing <= 0:
+        return []
+    # Build cumulative distances
+    segments: list[tuple[float, float, float, float, float]] = []  # (x0,y0,x1,y1,seg_len)
+    total_length = 0.0
+    for i in range(len(points) - 1):
+        x0, y0 = float(points[i].x), float(points[i].y)
+        x1, y1 = float(points[i + 1].x), float(points[i + 1].y)
+        seg_len = _math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
+        segments.append((x0, y0, x1, y1, seg_len))
+        total_length += seg_len
+    if total_length < spacing:
+        # Path too short — place one at midpoint
+        mx = (float(points[0].x) + float(points[-1].x)) / 2
+        my = (float(points[0].y) + float(points[-1].y)) / 2
+        yaw = _math.degrees(_math.atan2(-(float(points[-1].y) - float(points[0].y)), float(points[-1].x) - float(points[0].x)))
+        return [(mx, my, yaw)]
+    result: list[tuple[float, float, float]] = []
+    distance_along = 0.0
+    seg_idx = 0
+    seg_consumed = 0.0
+    while distance_along <= total_length + 0.01 and seg_idx < len(segments):
+        x0, y0, x1, y1, seg_len = segments[seg_idx]
+        if seg_len < 1e-6:
+            seg_idx += 1
+            seg_consumed = 0.0
+            continue
+        t = seg_consumed / seg_len
+        px = x0 + t * (x1 - x0)
+        py = y0 + t * (y1 - y0)
+        yaw = _math.degrees(_math.atan2(-(y1 - y0), x1 - x0))
+        result.append((px, py, yaw))
+        distance_along += spacing
+        seg_consumed += spacing
+        while seg_consumed > seg_len + 1e-6 and seg_idx < len(segments) - 1:
+            seg_consumed -= seg_len
+            seg_idx += 1
+            x0, y0, x1, y1, seg_len = segments[seg_idx]
+    return result
+
+
+def _walker_transform_from_points(world: Any, spawn_point: Any, destination_point: Any | None, spawn_yaw: float | None = None) -> Any:
     carla = _require_carla()
     location = _location_from_map_point(world, spawn_point, z_offset=0.2)
-    yaw = 0.0
+    yaw = float(spawn_yaw) if spawn_yaw is not None else 0.0
     if destination_point is not None:
         dx = float(destination_point.x) - float(spawn_point.x)
         dy = float(destination_point.y) - float(spawn_point.y)
@@ -445,10 +490,10 @@ def _walker_transform_from_points(world: Any, spawn_point: Any, destination_poin
     return carla.Transform(location, carla.Rotation(yaw=yaw))
 
 
-def _vehicle_transform_from_points(world: Any, spawn_point: Any, destination_point: Any | None) -> Any:
+def _vehicle_transform_from_points(world: Any, spawn_point: Any, destination_point: Any | None, spawn_yaw: float | None = None) -> Any:
     carla = _require_carla()
     location = _location_from_map_point(world, spawn_point, z_offset=0.35)
-    yaw = 0.0
+    yaw = float(spawn_yaw) if spawn_yaw is not None else 0.0
     if destination_point is not None:
         dx = float(destination_point.x) - float(spawn_point.x)
         dy = float(destination_point.y) - float(spawn_point.y)
@@ -767,8 +812,18 @@ def _apply_path_vehicle_control(
         throttle *= 0.45 if reverse else 0.35
 
     brake = 0.0
-    if stop_at_target and distance < 8.0 and speed > max(1.2, cruise_speed * 0.5):
-        brake = min(0.75, (speed - cruise_speed * 0.4) / max(cruise_speed, 1.0))
+    if stop_at_target:
+        # Progressive deceleration: start slowing much earlier
+        if distance < 15.0 and speed > 2.0:
+            # Scale throttle down as we approach
+            approach_factor = max(0.0, (distance - arrival_distance_m) / 15.0)
+            throttle *= approach_factor
+        if distance < 8.0 and speed > max(1.2, cruise_speed * 0.3):
+            brake = min(0.85, (speed - cruise_speed * 0.25) / max(cruise_speed, 1.0))
+        # Hard brake in the last few meters if still moving fast
+        if distance < 4.0 and speed > 1.5:
+            brake = max(brake, 0.9)
+            throttle = 0.0
     if abs(yaw_error) > 1.35 and speed > 3.0:
         brake = max(brake, 0.3 if reverse else 0.45)
 
@@ -1039,6 +1094,7 @@ def _simulation_worker(
     path_vehicle_targets: list[tuple[Any, Any, float]] = []
     timed_path_vehicle_targets: list[dict[str, Any]] = []
     path_walker_targets: list[tuple[Any, Any, float]] = []
+    timed_path_walker_targets: list[dict[str, Any]] = []
     timeline_states: dict[str, TimelineActorState] = {}
     actor_by_handle_id: dict[int, ActorDraft] = {}
     handle_by_actor_id: dict[str, Any] = {}
@@ -1135,7 +1191,7 @@ def _simulation_worker(
                 )
                 if actor.placement_mode in {"path", "point", "timed_path"} and actor.spawn_point is not None:
                     vehicle_spawn_candidates = [
-                        _vehicle_transform_from_points(world, actor.spawn_point, _timed_path_heading_point(actor) if actor.placement_mode == "timed_path" else actor.destination_point)
+                        _vehicle_transform_from_points(world, actor.spawn_point, _timed_path_heading_point(actor) if actor.placement_mode == "timed_path" else actor.destination_point, spawn_yaw=getattr(actor, "spawn_yaw", None))
                     ]
                 else:
                     vehicle_spawn_candidates = _road_spawn_transform_candidates(
@@ -1285,12 +1341,25 @@ def _simulation_worker(
                         timed_path_vehicle_targets.append({
                             "vehicle": vehicle,
                             "waypoints": wp_locations,
-                            "index": 1 if len(wp_locations) > 1 else 0,
+                            "index": 0,
                             "max_speed_mps": max(1.0, actor.speed_kph / 3.6),
                         })
                 elif actor.placement_mode == "point" or actor.is_static:
                     _set_vehicle_autopilot(vehicle, False, settings["tm_port"])
                     vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0, hand_brake=True))
+                    # Path placement: spawn additional copies along polyline
+                    if actor.path_placement and len(actor.path_placement) >= 2:
+                        distributed = _distribute_along_polyline(actor.path_placement, actor.path_spacing)
+                        for di, (dx, dy, dyaw) in enumerate(distributed):
+                            loc = carla.Location(x=dx, y=-dy, z=0.35)
+                            t = carla.Transform(loc, carla.Rotation(yaw=dyaw))
+                            extra = world.try_spawn_actor(blueprint, t)
+                            if extra:
+                                _set_vehicle_autopilot(extra, False, settings["tm_port"])
+                                extra.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0, hand_brake=True))
+                                actors.append((actor, extra))
+                                _append_debug_log(debug_log, f"Spawned static vehicle {actor.label}[{di}] along path at ({dx:.1f}, {dy:.1f})")
+                        _append_debug_log(debug_log, f"Path placement for {actor.label}: {len(distributed)} copies, spacing={actor.path_spacing}m")
                 elif actor.autopilot:
                     _set_vehicle_autopilot(vehicle, True, settings["tm_port"])
                     timeline_states[actor.id].autopilot_applied = True
@@ -1299,7 +1368,7 @@ def _simulation_worker(
                     _set_vehicle_autopilot(vehicle, False, settings["tm_port"])
             elif actor.kind == "walker":
                 if actor.placement_mode in {"path", "point", "timed_path"} and actor.spawn_point is not None:
-                    transform = _walker_transform_from_points(world, actor.spawn_point, _timed_path_heading_point(actor) if actor.placement_mode == "timed_path" else actor.destination_point)
+                    transform = _walker_transform_from_points(world, actor.spawn_point, _timed_path_heading_point(actor) if actor.placement_mode == "timed_path" else actor.destination_point, spawn_yaw=getattr(actor, "spawn_yaw", None))
                 else:
                     anchor = _resolve_anchor(
                         waypoint_index,
@@ -1359,6 +1428,20 @@ def _simulation_worker(
                 if actor.placement_mode == "path" and actor.destination_point is not None:
                     destination_location = _location_from_map_point(world, actor.destination_point, z_offset=0.0)
                     path_walker_targets.append((walker, destination_location, max(0.5, actor.speed_kph / 3.6)))
+                elif actor.placement_mode == "timed_path" and (actor.timed_waypoints or []):
+                    wp_locations = []
+                    for wp in (actor.timed_waypoints or []):
+                        wp_locations.append({
+                            "location": _location_from_map_point(world, wp, z_offset=0.0),
+                            "time": float(wp.time),
+                        })
+                    if wp_locations:
+                        timed_path_walker_targets.append({
+                            "walker": walker,
+                            "waypoints": wp_locations,
+                            "index": 0,
+                            "max_speed_mps": max(0.5, actor.speed_kph / 3.6),
+                        })
                 else:
                     controller_bp = blueprint_library.find("controller.ai.walker")
                     controller = world.try_spawn_actor(controller_bp, carla.Transform(), attach_to=walker)
@@ -1381,10 +1464,28 @@ def _simulation_worker(
                 handle_by_actor_id[actor.id] = walker
 
             elif actor.kind == "prop":
+                # Path placement: spawn multiple copies along a polyline
+                if actor.path_placement and len(actor.path_placement) >= 2:
+                    distributed = _distribute_along_polyline(actor.path_placement, actor.path_spacing)
+                    prop_bps = blueprint_library.filter(actor.blueprint)
+                    if not prop_bps:
+                        _append_debug_log(debug_log, f"Prop {actor.label}: blueprint {actor.blueprint} not found, skipping path placement")
+                    else:
+                        prop_bp = prop_bps[0]
+                        for di, (dx, dy, dyaw) in enumerate(distributed):
+                            loc = carla.Location(x=dx, y=-dy, z=0.05)
+                            t = carla.Transform(loc, carla.Rotation(yaw=dyaw))
+                            h = world.try_spawn_actor(prop_bp, t)
+                            if h:
+                                actors.append((actor, h))
+                                _append_debug_log(debug_log, f"Spawned prop {actor.label}[{di}] along path at ({dx:.1f}, {dy:.1f}) yaw={dyaw:.0f}")
+                        _append_debug_log(debug_log, f"Path placement for {actor.label}: {len(distributed)} copies along {len(actor.path_placement)} points, spacing={actor.path_spacing}m")
+                    continue
                 # Static props - spawn at freeform point or road anchor
                 if actor.spawn_point:
-                    loc = carla.Location(x=actor.spawn_point.x, y=-actor.spawn_point.y, z=0.5)
-                    transform = carla.Transform(loc, carla.Rotation())
+                    loc = carla.Location(x=actor.spawn_point.x, y=-actor.spawn_point.y, z=0.05)
+                    prop_yaw = float(getattr(actor, "spawn_yaw", 0) or 0)
+                    transform = carla.Transform(loc, carla.Rotation(yaw=prop_yaw))
                 else:
                     anchor = _resolve_anchor(
                         waypoint_index,
@@ -1398,7 +1499,7 @@ def _simulation_worker(
                         _append_debug_log(debug_log, f"Prop {actor.label}: anchor resolution failed, skipping")
                         continue
                     transform = anchor.transform
-                    transform.location.z += 0.5
+                    transform.location.z += 0.05
 
                 prop_bps = blueprint_library.filter(actor.blueprint)
                 if not prop_bps:
@@ -1700,10 +1801,13 @@ def _simulation_worker(
                 if simulation_time > target_time:
                     desired_speed_mps = max_speed_mps
                 is_final = wp_index >= len(waypoints) - 1
+                # Decelerate on approach to final waypoint
+                if is_final and distance < 12.0:
+                    desired_speed_mps = min(desired_speed_mps, max(1.5, distance * 0.6))
                 reached = _apply_path_vehicle_control(
                     carla, vehicle, target_location, desired_speed_mps,
                     stop_at_target=is_final,
-                    arrival_distance_m=3.0 if not is_final else 2.5,
+                    arrival_distance_m=2.5,
                 )
                 if reached:
                     _append_debug_log(debug_log, f"[TIMED] Reached wp {wp_index}/{len(waypoints)-1} at t={simulation_time:.2f}s (target t={target_time:.1f}s) dist={distance:.1f}m")
@@ -1720,6 +1824,47 @@ def _simulation_worker(
                     vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
                     _append_debug_log(debug_log, f"[TIMED] All waypoints done, braking at t={simulation_time:.2f}s")
             timed_path_vehicle_targets = remaining_timed_targets
+
+            # --- Timed path walker control ---
+            remaining_timed_walker_targets: list[dict[str, Any]] = []
+            for timed_target in timed_path_walker_targets:
+                walker = timed_target.get("walker")
+                waypoints = timed_target.get("waypoints") or []
+                wp_index = int(timed_target.get("index") or 0)
+                max_speed_mps = float(timed_target.get("max_speed_mps") or 1.5)
+                if not walker or not getattr(walker, "is_alive", False) or wp_index >= len(waypoints):
+                    if wp_index >= len(waypoints):
+                        _append_debug_log(debug_log, f"[TIMED-WALKER] All {len(waypoints)} waypoints completed at t={simulation_time:.2f}s")
+                    continue
+                target_wp = waypoints[wp_index]
+                target_location = target_wp["location"]
+                target_time = target_wp["time"]
+                time_remaining = max(0.05, target_time - simulation_time)
+                transform = walker.get_transform()
+                loc = transform.location
+                dx = float(target_location.x) - float(loc.x)
+                dy = float(target_location.y) - float(loc.y)
+                distance = math.sqrt(dx * dx + dy * dy)
+                arrived_early = distance <= 0.5 and simulation_time < target_time
+                if arrived_early:
+                    walker.apply_control(carla.WalkerControl(direction=carla.Vector3D(x=0.0, y=0.0, z=0.0), speed=0.0))
+                    remaining_timed_walker_targets.append(timed_target)
+                    continue
+                desired_speed_mps = min(max_speed_mps, distance / time_remaining)
+                if simulation_time > target_time:
+                    desired_speed_mps = max_speed_mps
+                is_final = wp_index >= len(waypoints) - 1
+                reached = _apply_path_walker_control(carla, walker, target_location, desired_speed_mps)
+                if reached:
+                    _append_debug_log(debug_log, f"[TIMED-WALKER] Reached wp {wp_index}/{len(waypoints)-1} at t={simulation_time:.2f}s (target t={target_time:.1f}s)")
+                    timed_target["index"] = wp_index + 1
+                new_index = int(timed_target.get("index") or 0)
+                if new_index < len(waypoints):
+                    remaining_timed_walker_targets.append(timed_target)
+                else:
+                    walker.apply_control(carla.WalkerControl(direction=carla.Vector3D(x=0.0, y=0.0, z=0.0), speed=0.0))
+                    _append_debug_log(debug_log, f"[TIMED-WALKER] All waypoints done, stopping at t={simulation_time:.2f}s")
+            timed_path_walker_targets = remaining_timed_walker_targets
 
             remaining_walker_targets: list[tuple[Any, Any, float]] = []
             for walker, target_location, target_speed_mps in path_walker_targets:
