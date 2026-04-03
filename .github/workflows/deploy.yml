@@ -1,0 +1,55 @@
+name: Deploy
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deploy target"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+jobs:
+  deploy-dev:
+    name: Deploy to Dev
+    if: github.ref == 'refs/heads/dev' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 216.151.21.122
+          username: ubuntu
+          password: ${{ secrets.GPU_SERVER_PASSWORD }}
+          script: |
+            cd /home/ubuntu/carla-scenario-orchestrator-dev
+            git pull origin dev
+            sudo systemctl restart carla-scenario-orchestrator-dev
+            sleep 5
+            curl -sf http://127.0.0.1:18422/api/health || (echo "Health check failed!" && exit 1)
+
+  deploy-prod:
+    name: Deploy to Prod
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 216.151.21.122
+          username: ubuntu
+          password: ${{ secrets.GPU_SERVER_PASSWORD }}
+          script: |
+            cd /home/ubuntu/carla-scenario-orchestrator
+            git pull origin main
+            sudo systemctl restart carla-scenario-orchestrator
+            sleep 8
+            curl -sf http://127.0.0.1:18421/api/health || (echo "Health check failed!" && exit 1)
