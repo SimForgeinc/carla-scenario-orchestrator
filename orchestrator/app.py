@@ -5,14 +5,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
-from starlette.responses import Response as StarletteResponse
 
 class PrivateNetworkAccessMiddleware(BaseHTTPMiddleware):
     """Allow Chrome Private Network Access (PNA) for Tailscale Funnel."""
@@ -25,10 +24,18 @@ class PrivateNetworkAccessMiddleware(BaseHTTPMiddleware):
 from .config import Settings
 from .models import CancelJobResponse, JobListResponse, JobRecord, JobSubmissionResponse
 from .service import OrchestratorService
+from .auth import (
+    SurfaceTokenClaims,
+    authorize_job_submission,
+    ensure_job_cancel_access,
+    ensure_job_read_access,
+    filter_jobs_for_surface_token,
+    require_surface_scope,
+    surface_token_from_authorization,
+)
+from .map_context import get_map_context as get_map_context_from_db
 from .carla_runner.models import (
-    LLMGenerateRequest,
     MapLoadRequest,
-    SceneAssistantRequest,
     SimulationRunRequest,
 )
 
@@ -44,6 +51,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CARLA Scenario Orchestrator", lifespan=lifespan)
+
+
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+import logging
+_logger = logging.getLogger("validation")
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    _logger.error("422 VALIDATION ERROR on %s: %s", request.url, exc.errors())
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 # Prometheus metrics endpoint at /metrics
 try:
@@ -62,6 +79,14 @@ app.add_middleware(
 
 app.add_middleware(PrivateNetworkAccessMiddleware)
 
+
+async def require_internal_api_key(x_api_key: str = Header(default="", alias="X-API-Key")):
+    """Require a valid API key for internal utility endpoints when configured."""
+    expected = service.settings.internal_api_key
+    if not expected:
+        return
+    if x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 @app.get("/api/health")
@@ -138,50 +163,64 @@ async def actor_blueprints():
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.post("/api/llm/generate")
-async def llm_generate(request: LLMGenerateRequest):
-    if not request.selected_roads:
-        raise HTTPException(status_code=400, detail="Select at least one road before generating actors.")
-    try:
-        return service.llm_generate(request)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@app.post("/api/llm/scene-assistant")
-async def llm_scene_assistant(request: SceneAssistantRequest):
-    try:
-        return service.llm_scene_assistant_chat(request)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+@app.get("/api/map-context")
+async def api_map_context(carla_map_name: str = ""):
+    if not carla_map_name.strip():
+        raise HTTPException(status_code=400, detail="carla_map_name query parameter is required")
+    context = get_map_context_from_db(carla_map_name.strip())
+    if context is None:
+        return {"found": False, "carla_map_name": carla_map_name}
+    return {"found": True, **context}
 
 
 @app.get("/api/jobs", response_model=JobListResponse)
-async def list_jobs():
-    return service.list_jobs()
+async def list_jobs(surface_token: SurfaceTokenClaims | None = Depends(surface_token_from_authorization)):
+    jobs = service.list_jobs()
+    if surface_token is None:
+        return jobs
+    require_surface_scope(surface_token, "carla:job:read")
+    return filter_jobs_for_surface_token(jobs, surface_token)
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobRecord)
-async def get_job(job_id: str):
+async def get_job(
+    job_id: str,
+    surface_token: SurfaceTokenClaims | None = Depends(surface_token_from_authorization),
+):
     job = service.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
+    if surface_token is not None:
+        require_surface_scope(surface_token, "carla:job:read")
+        ensure_job_read_access(job, surface_token)
     return job
 
 
 @app.post("/api/jobs", response_model=JobSubmissionResponse)
-async def submit_job(request: SimulationRunRequest):
+async def submit_job(
+    request: SimulationRunRequest,
+    surface_token: SurfaceTokenClaims | None = Depends(surface_token_from_authorization),
+):
+    if surface_token is not None:
+        request = authorize_job_submission(service.list_jobs(), request, surface_token)
     return service.submit_job(request)
 
 
 @app.post("/api/jobs/{job_id}/cancel", response_model=CancelJobResponse)
-async def cancel_job(job_id: str):
+async def cancel_job(
+    job_id: str,
+    surface_token: SurfaceTokenClaims | None = Depends(surface_token_from_authorization),
+):
     try:
+        if surface_token is not None:
+            require_surface_scope(surface_token, "carla:job:cancel")
+            job = service.get_job(job_id)
+            if job is None:
+                raise KeyError(job_id)
+            ensure_job_cancel_access(job, surface_token)
         return service.cancel_job(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Job not found.") from exc
-
-
 
 
 class PreloadRequest(BaseModel):
@@ -264,17 +303,6 @@ async def job_stream(job_id: str, websocket: WebSocket):
         return
 
 
-
-
-
-
-
-
-
-
-
-
-
 @app.get('/api/jobs/{job_id}/log')
 async def job_log(job_id: str):
     log_text = service.get_job_log(job_id)
@@ -283,10 +311,12 @@ async def job_log(job_id: str):
     return {'log': log_text}
 
 
-
 @app.get("/api/jobs/{job_id}/diagnostics")
 async def job_diagnostics(job_id: str):
-    diagnostics = service.job_diagnostics(job_id)
+    try:
+        diagnostics = service.job_diagnostics(job_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     if diagnostics is None:
         raise HTTPException(status_code=404, detail="Diagnostics not found for this job.")
     return diagnostics
@@ -302,11 +332,10 @@ async def job_recordings(job_id: str):
     return {"items": [item.model_dump() for item in matched]}
 
 
-
 @app.get("/api/recordings")
-async def list_all_recordings(source_run_id: str | None = None):
-    """List all recordings, optionally filtered by source_run_id (scenario ID)."""
-    recordings = service.list_recordings(source_run_id=source_run_id)
+async def list_all_recordings(scenario_id: str | None = None):
+    """List all recordings, optionally filtered by scenario_id (scenario ID)."""
+    recordings = service.list_recordings(scenario_id=scenario_id)
     return {"items": [r.model_dump() for r in recordings]}
 
 # DEPRECATED: legacy path was /api/simulation/recordings/file
@@ -319,3 +348,68 @@ async def recording_file(path: str):
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Recording not found.")
     return FileResponse(file_path)
+
+# ── Server Status Endpoints (replaces separate monitor app) ──────────────────
+
+from .server_status import (
+    get_full_server_status,
+    get_container_logs,
+    restart_container,
+)
+
+
+@app.get("/api/server/status")
+async def server_status():
+    """GPU hardware, system memory, disk, uptime, Docker containers."""
+    return get_full_server_status()
+
+
+@app.get("/api/server/logs")
+async def server_container_logs(container: str, lines: int = 100):
+    """Docker container logs."""
+    try:
+        logs = get_container_logs(container, lines)
+        return {"container": container, "logs": logs, "lines": lines}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/server/restart")
+async def server_restart_container(request: StarletteRequest):
+    """Restart a Docker container."""
+    body = await request.json()
+    container_name = body.get("container", "")
+    if not container_name:
+        raise HTTPException(status_code=400, detail="container name required")
+    try:
+        result = restart_container(container_name)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/map/street-furniture")
+async def get_street_furniture():
+    try:
+        return service.carla_metadata.get_street_furniture()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/scene/export-png")
+async def export_scene_png(request: Request, _=Depends(require_internal_api_key)):
+    """Export current scene setup as a cropped PNG showing actors on roads."""
+    from .scene_export import render_scene_png
+    body = await request.json()
+    actors = body.get("actors", [])
+    selected_roads = body.get("selected_roads", [])
+    map_name = body.get("map_name", "")
+    png_bytes = render_scene_png(service, actors, selected_roads, map_name)
+    if png_bytes is None:
+        from starlette.responses import Response
+        # Fallback: return SVG
+        from .scene_export import render_scene_svg
+        svg_str = render_scene_svg(service, actors, selected_roads, map_name)
+        return Response(content=svg_str, media_type="image/svg+xml")
+    from starlette.responses import Response
+    return Response(content=png_bytes, media_type="image/png")

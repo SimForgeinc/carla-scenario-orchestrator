@@ -231,7 +231,7 @@ def _road_matches_filters(
 
 
 def _road_search_result(map_name: str, road: dict[str, Any], matching_sections: list[dict[str, Any]]) -> dict[str, Any]:
-    # Build lane info from sections so the LLM can place actors without calling get_road
+    # Build lane info from sections so actor placement tools can use sections without calling get_road
     sections_with_lanes = []
     suggested_spawn = None
     for section in matching_sections:

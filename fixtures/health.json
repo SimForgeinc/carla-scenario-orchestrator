@@ -1,0 +1,1 @@
+{"ok":true,"status":"healthy","total_slots":1,"busy_slots":0,"queued_jobs":0,"carla_connected":true,"metadata_connected":true,"metadata_slot_index":null,"running":false,"simulation_running":false,"connections":0,"langchain_available":true,"langsmith_available":true,"langsmith_tracing":false}

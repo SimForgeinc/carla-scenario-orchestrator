@@ -37,6 +37,7 @@ class GpuScheduler:
         self._slot_errors: dict[int, str | None] = {}
         self._slot_map: dict[int, str | None] = {}
         self._slot_last_released: dict[int, float] = {}
+        self._waiting: dict[str, str] = {}  # job_id -> priority
         self._metadata_slot_index = settings.metadata_slot_index
         for idx, device_id in enumerate(settings.gpu_devices):
             role = "metadata" if (self._metadata_slot_index >= 0 and idx == self._metadata_slot_index) else "execution"
@@ -106,39 +107,52 @@ class GpuScheduler:
             return self._slot_map.get(slot_index)
 
     def acquire(self, job_id: str, cancel_event: threading.Event,
-                *, map_name: str | None = None) -> GpuLease:
-        """Acquire a free execution slot, preferring map match + least recently used."""
+                *, map_name: str | None = None, priority: str = "interactive") -> GpuLease:
+        """Acquire a free execution slot. Interactive jobs are served before batch."""
         with self._condition:
-            while True:
-                if cancel_event.is_set():
-                    raise RuntimeError("Job cancelled before a GPU slot was assigned.")
+            self._waiting[job_id] = priority
+            try:
+                while True:
+                    if cancel_event.is_set():
+                        raise RuntimeError("Job cancelled before a GPU slot was assigned.")
 
-                # Collect all free execution slots
-                free_slots: list[GpuLease] = []
-                for slot in self._slots:
-                    if slot.role != "execution":
-                        continue
-                    if self._slot_status.get(slot.slot_index) != "ready":
-                        continue
-                    if slot.slot_index in self._job_by_slot:
-                        continue
-                    free_slots.append(slot)
+                    # Collect all free execution slots
+                    free_slots: list[GpuLease] = []
+                    for slot in self._slots:
+                        if slot.role != "execution":
+                            continue
+                        if self._slot_status.get(slot.slot_index) != "ready":
+                            continue
+                        if slot.slot_index in self._job_by_slot:
+                            continue
+                        free_slots.append(slot)
 
-                if free_slots:
-                    # Separate into map-matching and non-matching
-                    matching = [s for s in free_slots
-                                if map_name and self._slot_map.get(s.slot_index) == map_name]
-                    candidates = matching if matching else free_slots
+                    if free_slots:
+                        # Separate into map-matching and non-matching
+                        matching = [s for s in free_slots
+                                    if map_name and self._slot_map.get(s.slot_index) == map_name]
+                        candidates = matching if matching else free_slots
 
-                    # Among candidates, pick the one idle longest (LRU)
-                    best = min(candidates,
-                               key=lambda s: self._slot_last_released.get(s.slot_index, 0.0))
+                        # Among candidates, pick the one idle longest (LRU)
+                        best = min(candidates,
+                                   key=lambda s: self._slot_last_released.get(s.slot_index, 0.0))
 
-                    self._job_by_slot[best.slot_index] = job_id
-                    self._leases_by_job[job_id] = best
-                    return best
+                        # Batch jobs yield when interactive jobs are queued
+                        if priority == "batch" and any(
+                            p == "interactive"
+                            for jid, p in self._waiting.items() if jid != job_id
+                        ):
+                            self._condition.wait(timeout=0.5)
+                            continue
 
-                self._condition.wait(timeout=0.5)
+                        self._waiting.pop(job_id, None)
+                        self._job_by_slot[best.slot_index] = job_id
+                        self._leases_by_job[job_id] = best
+                        return best
+
+                    self._condition.wait(timeout=0.5)
+            finally:
+                self._waiting.pop(job_id, None)
 
     def release(self, job_id: str) -> None:
         import time as _time

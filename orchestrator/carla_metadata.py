@@ -179,6 +179,25 @@ class CarlaMetadataService:
         return cached.current_map if cached and cached.connected else None
 
     def warm_cache(self) -> None:
+        # Register custom CARLA maps in the generated map cache
+        # so list_supported_maps() returns them and get_status() includes them.
+        # Skip default CARLA towns (Town*, AnnotationColor*) — only show custom maps.
+        _DEFAULT_MAP_PREFIXES = ("Town", "AnnotationColor")
+        try:
+            client = self._client()
+            available = client.get_available_maps()
+            seeded = 0
+            for map_path in available:
+                normalized = normalize_map_name(map_path)
+                if not normalized:
+                    continue
+                if normalized.startswith(_DEFAULT_MAP_PREFIXES):
+                    continue
+                set_generated_map_cache(normalized, {"name": normalized, "roads": [], "seeded": True})
+                seeded += 1
+            logger.info("Seeded map cache with %d custom CARLA maps (skipped %d default)", seeded, len(available) - seeded)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to seed map cache from CARLA: %s", exc)
         try:
             self.get_status(force_refresh=True)
         except Exception as exc:  # noqa: BLE001

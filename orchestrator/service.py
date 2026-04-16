@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 
 import json
 import logging
@@ -22,19 +23,13 @@ from .models import (
     RuntimeLaunchSpec,
 )
 from .carla_metadata import CarlaMetadataService
-from .llm import BedrockScenarioLLM, BedrockSceneAssistant
-from .llm.langchain_support import LANGCHAIN_AVAILABLE, LANGSMITH_AVAILABLE, langsmith_tracing_enabled
 from .runtime_backend import DockerRuntimeBackend, RuntimeBackend
 from .scheduler import GpuScheduler
 from .worker_pool import WorkerPool
 from .store import JobStore
 from .carla_runner.dataset_repository import list_supported_maps, normalize_map_name
 from .carla_runner.models import (
-    LLMGenerateRequest,
-    LLMGenerateResponse,
     RecordingInfo,
-    SceneAssistantRequest,
-    SceneAssistantResponse,
     SimulationRunDiagnostics,
     SimulationRunRequest,
     SimulationStreamMessage,
@@ -63,13 +58,15 @@ class OrchestratorService:
             self.artifact_storage = S3ArtifactStorage(settings)
         else:
             self.artifact_storage = NullArtifactStorage()
-        self.carla_metadata = CarlaMetadataService(
-            host=settings.carla_metadata_host,
-            timeout=settings.carla_metadata_timeout,
-            slot_resolver=self._resolve_metadata_slot,
-        )
-        self.llm = BedrockScenarioLLM()
-        self.scene_assistant = BedrockSceneAssistant(carla_metadata=self.carla_metadata)
+        if os.environ.get('MOCK_CARLA', '').lower() in ('1', 'true'):
+            from .mock_carla_metadata import MockCarlaMetadataService
+            self.carla_metadata = MockCarlaMetadataService()
+        else:
+            self.carla_metadata = CarlaMetadataService(
+                host=settings.carla_metadata_host,
+                timeout=settings.carla_metadata_timeout,
+                slot_resolver=self._resolve_metadata_slot,
+            )
         self.worker_pool: WorkerPool | None = None
         self._cancel_events: dict[str, threading.Event] = {}
         self._threads: dict[str, threading.Thread] = {}
@@ -122,7 +119,15 @@ class OrchestratorService:
     def startup(self) -> None:
         self._ensure_runtime_pool_started()
         if self.settings.warm_metadata_cache_on_startup:
-            threading.Thread(target=self.carla_metadata.warm_cache, daemon=True).start()
+            def _warm_and_load_default():
+                self.carla_metadata.warm_cache()
+                if self.settings.default_map:
+                    try:
+                        logger.info("Loading default map: %s", self.settings.default_map)
+                        self.carla_metadata.load_map(self.settings.default_map)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Failed to load default map %s: %s", self.settings.default_map, exc)
+            threading.Thread(target=_warm_and_load_default, daemon=True).start()
 
     def _ensure_runtime_pool_started(self) -> None:
         with self._lock:
@@ -170,20 +175,22 @@ class OrchestratorService:
         current = self.store.get(job_id)
         assert current is not None
 
-        # Write simulation record to Aurora
-        try:
-            sim_id = create_simulation(
-                scenario_id=request.source_run_id or job_id,
-                workspace_id=None,
-                map_name=request.map_name,
-                orchestrator_job_id=job_id,
-                request_payload=request.model_dump(),
-            )
-            self.store.update(job_id, simulation_id=sim_id)
-            logger.info(f"Aurora simulation record created: {sim_id}")
-            # Store workspace for artifact creation later
-        except Exception as exc:
-            logger.warning(f"Failed to create Aurora simulation record (non-fatal): {exc}")
+        # Only persist render jobs to Aurora (skip preview/simulate-interaction)
+        should_persist = request.topdown_recording or bool(request.sensors)
+        if should_persist:
+            try:
+                sim_id = create_simulation(
+                    scenario_id=request.scenario_id or job_id,
+                    workspace_id=None,
+                    map_name=request.map_name,
+                    orchestrator_job_id=job_id,
+                    request_payload=request.model_dump(),
+                )
+                self.store.update(job_id, simulation_id=sim_id)
+                logger.info(f"Aurora simulation record created: {sim_id}")
+                # Store workspace for artifact creation later
+            except Exception as exc:
+                logger.warning(f"Failed to create Aurora simulation record (non-fatal): {exc}")
 
         return JobSubmissionResponse(job_id=job_id, state=current.state, queue_position=current.queue_position)
 
@@ -217,23 +224,24 @@ class OrchestratorService:
 
     def health(self) -> HealthResponse:
         capacity = self.scheduler.snapshot()
-        # When no dedicated metadata slot, check if any execution slot is ready
-        metadata_connected = capacity.metadata_ready if capacity.metadata_slots > 0 else capacity.ready_slots > 0
-        overall_status = "healthy" if capacity.unavailable_slots == 0 and metadata_connected else "degraded"
+        healthy_execution_slots = max(capacity.total_slots - capacity.unavailable_slots, 0)
+        queue_accepting = healthy_execution_slots > 0
+        capacity_available = capacity.ready_slots > 0
+        metadata_connected = capacity.metadata_ready if capacity.metadata_slots > 0 else queue_accepting
+        overall_status = "healthy" if queue_accepting else "degraded"
         return HealthResponse(
             status=overall_status,
             total_slots=capacity.total_slots,
             busy_slots=capacity.busy_slots,
             queued_jobs=self.store.queued_count(),
-            carla_connected=metadata_connected,
+            queue_accepting=queue_accepting,
+            capacity_available=capacity_available,
+            carla_connected=queue_accepting,
             metadata_connected=metadata_connected,
             metadata_slot_index=capacity.metadata_slot_index,
             running=capacity.busy_slots > 0,
             simulation_running=capacity.busy_slots > 0,
             connections=0,
-            langchain_available=LANGCHAIN_AVAILABLE,
-            langsmith_available=LANGSMITH_AVAILABLE,
-            langsmith_tracing=langsmith_tracing_enabled(),
         )
 
     def carla_status(self):
@@ -254,11 +262,6 @@ class OrchestratorService:
     def actor_blueprints(self) -> dict[str, list[str]]:
         return self.carla_metadata.list_blueprints()
 
-    def llm_generate(self, request: LLMGenerateRequest) -> LLMGenerateResponse:
-        return self.llm.generate(request)
-
-    def llm_scene_assistant_chat(self, request: SceneAssistantRequest) -> SceneAssistantResponse:
-        return self.scene_assistant.chat(request)
 
     def latest_job(self) -> JobRecord | None:
         return self.store.latest()
@@ -276,60 +279,80 @@ class OrchestratorService:
             "waypoints": waypoints,
         }
 
-    def list_recordings(self, source_run_id: str | None = None) -> list[RecordingInfo]:
+    def list_recordings(self, scenario_id: str | None = None) -> list[RecordingInfo]:
         items: list[RecordingInfo] = []
         for job in self.store.list():
             if not job.run_id:
                 continue
-            if source_run_id and getattr(job.request, 'source_run_id', None) != source_run_id:
+            if scenario_id and getattr(job.request, 'scenario_id', None) != scenario_id:
                 continue
 
-            # Build S3 URL lookup from uploaded artifacts
-            s3_urls_by_label: dict[str, str] = {}
-            for artifact in job.artifacts.uploaded_artifacts:
-                if artifact.kind == "MP4" and artifact.s3_key:
-                    url = f"https://{artifact.s3_bucket}.s3.amazonaws.com/{artifact.s3_key}"
-                    key = artifact.label or "recording.mp4"
-                    s3_urls_by_label[key] = url
-
-            # Top-down recording (legacy single-camera path)
-            if job.artifacts.recording_path:
-                items.append(
-                    RecordingInfo(
-                        run_id=job.run_id,
-                        label=f"{job.request.map_name} ({job.job_id})",
-                        mp4_path=job.artifacts.recording_path,
-                        frames_path=None,
-                        created_at=job.updated_at.isoformat(),
-                        source_run_id=getattr(job.request, 'source_run_id', None),
-                        s3_url=s3_urls_by_label.get("recording.mp4"),
-                    )
+            uploaded_mp4s = [
+                artifact for artifact in job.artifacts.uploaded_artifacts
+                if (
+                    (artifact.kind or "").lower() in {"mp4", "recording"}
+                    or (artifact.content_type or "").startswith("video/")
+                    or (artifact.file_ext or "").lower() == "mp4"
+                    or (artifact.s3_key or "").lower().endswith(".mp4")
                 )
+            ]
 
-            # Per-sensor recordings from manifest
+            # Prefer the manifest when local run files are still present; after
+            # S3-first cleanup, fall back to uploaded artifact metadata.
+            appended_from_manifest = False
             try:
                 manifest_path = Path(job.artifacts.output_dir) / job.run_id / "manifest.json"
                 if manifest_path.exists():
                     manifest = _json.loads(manifest_path.read_text())
                     sensor_outputs = manifest.get("sensor_outputs") or {}
                     sensor_labels = manifest.get("sensor_labels") or {}
+                    artifacts_by_label = {artifact.label: artifact for artifact in uploaded_mp4s if artifact.label}
+                    artifacts_by_local_path = {artifact.local_path: artifact for artifact in uploaded_mp4s if artifact.local_path}
                     for sensor_id, mp4_path in sensor_outputs.items():
                         if not mp4_path:
                             continue
                         label = sensor_labels.get(sensor_id, sensor_id)
+                        artifact = artifacts_by_label.get(label) or artifacts_by_local_path.get(mp4_path)
+                        s3_url = (
+                            f"https://{artifact.s3_bucket}.s3.amazonaws.com/{artifact.s3_key}"
+                            if artifact and artifact.s3_bucket and artifact.s3_key
+                            else None
+                        )
                         items.append(
                             RecordingInfo(
                                 run_id=job.run_id,
                                 label=label,
-                                mp4_path=mp4_path,
+                                mp4_path=(artifact.s3_key if artifact and artifact.s3_key else mp4_path),
                                 frames_path=None,
                                 created_at=job.updated_at.isoformat(),
-                                source_run_id=getattr(job.request, 'source_run_id', None),
-                                s3_url=s3_urls_by_label.get(sensor_id),
+                                scenario_id=getattr(job.request, 'scenario_id', None),
+                                s3_url=s3_url,
                             )
                         )
+                        appended_from_manifest = True
             except Exception:
-                pass  # manifest may not exist for old jobs
+                pass
+
+            if appended_from_manifest:
+                continue
+
+            for artifact in uploaded_mp4s:
+                s3_url = (
+                    f"https://{artifact.s3_bucket}.s3.amazonaws.com/{artifact.s3_key}"
+                    if artifact.s3_bucket and artifact.s3_key
+                    else None
+                )
+                items.append(
+                    RecordingInfo(
+                        run_id=job.run_id,
+                        label=artifact.label or artifact.s3_key or artifact.local_path or "recording.mp4",
+                        mp4_path=artifact.s3_key or artifact.local_path,
+                        frames_path=None,
+                        created_at=job.updated_at.isoformat(),
+                        scenario_id=getattr(job.request, 'scenario_id', None),
+                        s3_url=s3_url,
+                    )
+                )
 
         items.sort(key=lambda item: item.created_at, reverse=True)
         return items
@@ -348,7 +371,10 @@ class OrchestratorService:
                 manifest_path = job.artifacts.manifest_path
                 if not manifest_path:
                     return None
-                return self._read_run_diagnostics(Path(manifest_path))
+                p = Path(manifest_path)
+                if not p.is_file():
+                    return None
+                return self._read_run_diagnostics(p)
         return None
 
 
@@ -384,11 +410,6 @@ class OrchestratorService:
             run_id=run_id,
             map_name=str(data.get("map_name") or ""),
             created_at=str(data.get("created_at") or ""),
-            selected_roads=list(data.get("selected_roads") or []),
-            actors=list(data.get("actors") or []),
-            recording_path=data.get("recording_path"),
-            scenario_log_path=data.get("scenario_log"),
-            debug_log_path=debug_log_path,
             worker_error=data.get("worker_error"),
             saved_frame_count=int(data.get("saved_frame_count") or 0),
             sensor_timeout_count=int(data.get("sensor_timeout_count") or 0),
@@ -419,7 +440,7 @@ class OrchestratorService:
             cancel_event = self._cancel_events[job_id]
         self._send_phase(job_id, "acquiring_gpu", "Waiting for available GPU slot")
         try:
-            lease = self.scheduler.acquire(job_id, cancel_event, map_name=normalize_map_name(job.request.map_name))
+            lease = self.scheduler.acquire(job_id, cancel_event, map_name=normalize_map_name(job.request.map_name), priority=getattr(job.request, 'priority', 'interactive'))
         except RuntimeError as exc:
             current = self.store.get(job_id)
             if current is not None and current.state == JobState.cancelled:
@@ -485,6 +506,7 @@ class OrchestratorService:
                 run_id=result.run_id,
                 artifacts=local_artifacts,
             )
+            # Always upload artifacts to S3 (preview frames need them even without a simulation record)
             self._send_phase(job_id, "uploading", "Uploading artifacts to S3")
             if hasattr(self.artifact_storage, 'upload_all_and_delete_local'):
                 uploaded_artifacts = self.artifact_storage.upload_all_and_delete_local(current)
@@ -495,16 +517,15 @@ class OrchestratorService:
                 final_artifacts = current.artifacts.model_copy(update={"uploaded_artifacts": uploaded_artifacts})
             self.store.update(
                 job_id,
-                state=result.state,
                 error=result.error,
                 run_id=result.run_id,
                 artifacts=final_artifacts,
             )
 
-            # Write artifacts + final status to Aurora
+            # Write artifacts + final status to Aurora before surfacing terminal state
             try:
                 sim_id = getattr(current, "simulation_id", None)
-                scenario_id = current.request.source_run_id or job_id
+                scenario_id = current.request.scenario_id or job_id
                 if sim_id and uploaded_artifacts:
                     for art in uploaded_artifacts:
                         create_artifact(
@@ -527,7 +548,28 @@ class OrchestratorService:
                     status = "completed" if result.state.value == "succeeded" else result.state.value
                     update_simulation_status(sim_id, status, backend_run_id=result.run_id, error_message=result.error)
             except Exception as exc:
-                logger.warning(f"Failed to update Aurora simulation (non-fatal): {exc}")
+                raise RuntimeError(f"Failed to persist terminal simulation state to Aurora: {exc}") from exc
+
+            self.store.update(
+                job_id,
+                state=result.state,
+                error=result.error,
+                run_id=result.run_id,
+                artifacts=final_artifacts,
+            )
+
+            # Ensure a simulation_ended event exists in the stream for WebSocket consumers.
+            # For fast simulations the worker event batch may not have been delivered.
+            if result.state == JobState.succeeded:
+                job_after = self.store.get(job_id)
+                has_ended = any(
+                    getattr(e.payload, "simulation_ended", False) for e in (job_after.events if job_after else [])
+                )
+                if not has_ended:
+                    from .carla_runner.models import SimulationStreamMessage
+                    self.store.append_event(job_id, SimulationStreamMessage(
+                        frame=0, timestamp=0.0, actors=[], simulation_ended=True,
+                    ))
         except Exception as exc:  # noqa: BLE001
             final_state = JobState.cancelled if cancel_event.is_set() else JobState.failed
             self.store.update(job_id, state=final_state, error=str(exc))
@@ -563,6 +605,9 @@ class OrchestratorService:
         if self.settings.webhook_secret:
             headers["Authorization"] = f"Bearer {self.settings.webhook_secret}"
         body = job.model_dump(mode="json")
+        # The dashboard completion webhook only needs terminal state and artifacts;
+        # syncing every tick event makes webhook requests exceed the client timeout.
+        body["events"] = []
         max_attempts = 3
         for attempt in range(max_attempts):
             try:

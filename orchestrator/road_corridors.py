@@ -452,7 +452,7 @@ def adjust_corridors_for_junction_gaps(
     return adjusted
 
 
-def resolve_corridor_distance(corridor, distance_m: float) -> tuple[str, float]:
+def resolve_corridor_distance(corridor, distance_m: float, reference: str = "start") -> tuple[str, float]:
     """Resolve a distance along a corridor to (road_id, local_s_fraction).
 
     Handles junction dead zones: if distance falls between road segments
@@ -464,6 +464,8 @@ def resolve_corridor_distance(corridor, distance_m: float) -> tuple[str, float]:
     road_ids = corridor.road_ids if isinstance(corridor, RoadCorridor) else corridor.get("road_ids", [])
 
     distance = max(BOUNDARY_BUFFER_M, min(distance_m, total - BOUNDARY_BUFFER_M))
+    if reference == "end":
+        distance = max(BOUNDARY_BUFFER_M, min(total - distance, total - BOUNDARY_BUFFER_M))
 
     for i, (road_id, offset, length) in enumerate(zip(road_ids, seg_offsets, seg_lengths)):
         road_end = offset + length

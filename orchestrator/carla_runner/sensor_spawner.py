@@ -95,7 +95,7 @@ def spawn_sensors(world, blueprint_library, sensor_configs, actor_map, ego_vehic
                     bp.set_attribute("sensor_tick", str(1.0 / config.update_rate))
             elif config.sensor_category == "lidar":
                 bp.set_attribute("channels", str(config.channels))
-                bp.set_attribute("range", str(config.range_m))
+                bp.set_attribute("range", str(config.range))
                 bp.set_attribute("points_per_second", str(config.points_per_second))
                 bp.set_attribute("rotation_frequency", str(config.rotation_frequency))
             elif config.sensor_category == "radar":
@@ -106,19 +106,8 @@ def spawn_sensors(world, blueprint_library, sensor_configs, actor_map, ego_vehic
             transform = _build_transform(config.pose)
             attachment_type = _get_attachment_type(config.attachment_type)
 
-            if config.attach_to == "world" and config.world_position:
-                carla = _require_carla()
-                wp = config.world_position
-                wr = config.world_rotation
-                world_transform = carla.Transform(
-                    carla.Location(x=wp.x, y=wp.y, z=getattr(wr, "z", 8.0) if wr else 8.0),
-                    carla.Rotation(
-                        pitch=getattr(wr, "pitch", -15.0) if wr else -15.0,
-                        yaw=getattr(wr, "yaw", 0.0) if wr else 0.0,
-                        roll=getattr(wr, "roll", 0.0) if wr else 0.0,
-                    ),
-                )
-                sensor_actor = world.spawn_actor(bp, world_transform)
+            if config.attach_to == "world":
+                sensor_actor = world.spawn_actor(bp, transform)
             elif config.attach_to == "ego" and ego_vehicle:
                 sensor_actor = world.spawn_actor(bp, transform, attach_to=ego_vehicle, attachment_type=attachment_type)
             elif config.attach_to in actor_map:

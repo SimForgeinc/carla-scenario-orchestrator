@@ -49,7 +49,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 TEMPORAL_HOST = "localhost:7233"
-TASK_QUEUE_PREFIX = "carla-slot-"
+TASK_QUEUE_PREFIX = os.environ.get("ORCH_TASK_QUEUE_PREFIX", "carla-slot-")
 
 # Health check constants
 MAX_RESTART_FAILURES = 3          # Mark unhealthy after this many consecutive failures
@@ -79,12 +79,13 @@ async def run_simulation_activity(input: dict) -> dict:
 
     # Push events to orchestrator in real-time via HTTP callback
     job_id = input["job_id"]
-    orch_url = f"http://127.0.0.1:18421/api/jobs/{job_id}/events"
+    orch_port = os.environ.get("ORCH_API_PORT", "18421")
+    orch_url = f"http://127.0.0.1:{orch_port}/api/jobs/{job_id}/events"
 
     class EventPusher:
         def __init__(self):
             self._batch: list[dict] = []
-            self._batch_size = 20
+            self._batch_size = 4
             self._log = logging.getLogger(f"event-pusher-{job_id}")
 
         def put(self, envelope: dict) -> None:
@@ -205,11 +206,11 @@ class SimulationWorkflow:
         return await workflow.execute_activity(
             run_simulation_activity,
             input,
-            start_to_close_timeout=timedelta(minutes=20),
-            heartbeat_timeout=timedelta(seconds=120),
+            start_to_close_timeout=timedelta(hours=1),
+            heartbeat_timeout=timedelta(hours=1),
             retry_policy=RetryPolicy(
                 initial_interval=timedelta(seconds=2),
-                maximum_attempts=2,  # 1 retry on failure
+                maximum_attempts=1,  # no retries — CARLA failures are deterministic
                 non_retryable_error_types=["NonRetryableError"],
             ),
         )

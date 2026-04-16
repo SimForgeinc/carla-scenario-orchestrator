@@ -5,6 +5,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .ssm_env import load_ssm_parameters
+
 try:
     from dotenv import load_dotenv
 except ModuleNotFoundError:  # pragma: no cover - local fallback when deps are not installed yet
@@ -39,13 +41,16 @@ class Settings:
     storage_region: str
     storage_prefix: str
     warm_metadata_cache_on_startup: bool = True
+    default_map: str = ""
     webhook_url: str = ""
     webhook_secret: str = ""
+    internal_api_key: str = ""
 
     @classmethod
     def load(cls) -> "Settings":
         repo_root = Path(__file__).resolve().parents[1]
         load_dotenv(repo_root / ".env", override=False)
+        load_ssm_parameters(os.environ.get("SIMFORGE_ENV"), service="orchestrator")
         jobs_root = Path(os.environ.get("ORCH_JOBS_ROOT", repo_root / "runs")).resolve()
         jobs_root.mkdir(parents=True, exist_ok=True)
         gpu_devices = tuple(_split_csv(os.environ.get("ORCH_GPU_DEVICES", "0,1,2,3,4,5,6,7")))
@@ -86,11 +91,13 @@ class Settings:
             carla_metadata_timeout=float(os.environ.get("ORCH_CARLA_METADATA_TIMEOUT", "20")),
             warm_metadata_cache_on_startup=os.environ.get("ORCH_WARM_METADATA_CACHE_ON_STARTUP", "true").lower()
             not in {"0", "false", "no"},
+            default_map=os.environ.get("ORCH_DEFAULT_MAP", ""),
             webhook_url=os.environ.get("ORCH_WEBHOOK_URL", ""),
-            webhook_secret=os.environ.get("ORCH_WEBHOOK_SECRET", ""),
-            storage_bucket=(os.environ.get("ORCH_STORAGE_BUCKET") or "").strip() or None,
+            webhook_secret=os.environ.get("ORCH_WEBHOOK_SECRET") or os.environ.get("ORCHESTRATOR_WEBHOOK_SECRET", ""),
+            storage_bucket=((os.environ.get("ORCH_STORAGE_BUCKET") or os.environ.get("S3_BUCKET") or "").strip() or None),
             storage_region=os.environ.get("ORCH_STORAGE_REGION")
             or os.environ.get("AWS_REGION")
             or "us-east-1",
             storage_prefix=(os.environ.get("ORCH_STORAGE_PREFIX") or "runs").strip("/"),
+            internal_api_key=os.environ.get("ORCH_INTERNAL_API_KEY") or os.environ.get("ORCHESTRATOR_INTERNAL_API_KEY", ""),
         )

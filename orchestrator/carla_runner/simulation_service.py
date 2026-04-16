@@ -21,6 +21,7 @@ from pathlib import Path
 import base64
 import io
 from typing import Any
+from types import SimpleNamespace
 
 from .dataset_repository import build_selected_roads, build_runtime_road_summaries, dataset_lane_type_counts, normalize_map_name, set_generated_map_cache
 
@@ -281,8 +282,6 @@ def _canonical_selected_roads_for_request(request: SimulationRunRequest) -> list
         seen.add(normalized)
         road_ids.append(normalized)
 
-    for road in request.selected_roads:
-        add_road_id(road.id)
     for actor in request.actors:
         if actor.placement_mode != "road":
             continue
@@ -477,6 +476,101 @@ def _location_from_map_point(world: Any, point: Any, z_offset: float = 0.15) -> 
     x, y = frontend_to_carla_xy(point.x, point.y)
     ground_z = _estimate_ground_z(world, x, y)
     return carla.Location(x=x, y=y, z=ground_z + z_offset)
+
+
+FREEFORM_SPAWN_OFFSETS: tuple[tuple[float, float], ...] = (
+    (0.0, 0.0),
+    (0.5, 0.0),
+    (-0.5, 0.0),
+    (0.0, 0.5),
+    (0.0, -0.5),
+    (0.7, 0.7),
+    (0.7, -0.7),
+    (-0.7, 0.7),
+    (-0.7, -0.7),
+    (1.0, 0.0),
+)
+
+
+def _offset_map_point(point: Any, dx: float, dy: float) -> Any:
+    return SimpleNamespace(x=float(point.x) + dx, y=float(point.y) + dy)
+
+
+def _freeform_transform_candidates(
+    world: Any,
+    spawn_point: Any,
+    destination_point: Any | None,
+    spawn_yaw: float | None,
+    transform_builder: Any,
+) -> list[Any]:
+    return [
+        transform_builder(
+            world,
+            _offset_map_point(spawn_point, dx, dy),
+            destination_point,
+            spawn_yaw=spawn_yaw,
+        )
+        for dx, dy in FREEFORM_SPAWN_OFFSETS
+    ]
+
+
+def _prop_transform_from_point(point: Any, spawn_yaw: float | None = None) -> Any:
+    carla = _require_carla()
+    loc = carla.Location(x=float(point.x), y=-float(point.y), z=0.05)
+    yaw = float(spawn_yaw or 0.0)
+    return carla.Transform(loc, carla.Rotation(yaw=yaw))
+
+
+def _prop_transform_candidates(spawn_point: Any, spawn_yaw: float | None = None) -> list[Any]:
+    return [
+        _prop_transform_from_point(_offset_map_point(spawn_point, dx, dy), spawn_yaw)
+        for dx, dy in FREEFORM_SPAWN_OFFSETS
+    ]
+
+
+def _spawn_attempt_record(index: int, transform: Any, success: bool) -> dict[str, Any]:
+    location = transform.location
+    rotation = transform.rotation
+    return {
+        "index": index,
+        "success": success,
+        "x": float(location.x),
+        "y": float(location.y),
+        "z": float(location.z),
+        "yaw": float(rotation.yaw),
+    }
+
+
+def _try_spawn_actor_from_candidates_with_attempts(world: Any, blueprint: Any, transforms: list[Any]) -> tuple[Any | None, list[dict[str, Any]]]:
+    attempts: list[dict[str, Any]] = []
+    for index, transform in enumerate(transforms):
+        handle = world.try_spawn_actor(blueprint, transform)
+        attempts.append(_spawn_attempt_record(index, transform, handle is not None))
+        if handle is not None:
+            return handle, attempts
+    return None, attempts
+
+
+def _try_spawn_actor_from_candidates(world: Any, blueprint: Any, transforms: list[Any]) -> Any | None:
+    handle, _attempts = _try_spawn_actor_from_candidates_with_attempts(world, blueprint, transforms)
+    return handle
+
+
+def _spawn_attempt_summary(actor: ActorDraft, attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "actor_id": actor.id,
+        "label": actor.label,
+        "kind": actor.kind,
+        "role": actor.role,
+        "placement_mode": actor.placement_mode,
+        "authored_spawn_point": (
+            {"x": float(actor.spawn_point.x), "y": float(actor.spawn_point.y)}
+            if actor.spawn_point is not None
+            else None
+        ),
+        "attempts": attempts,
+        "success": any(attempt.get("success") for attempt in attempts),
+    }
 
 
 def _distribute_along_polyline(points: list, spacing: float) -> list[tuple[float, float, float]]:
@@ -1253,9 +1347,13 @@ def _simulation_worker(
                     road_length_lookup=road_lengths,
                 )
                 if actor.placement_mode in {"path", "point", "timed_path"} and actor.spawn_point is not None:
-                    vehicle_spawn_candidates = [
-                        _vehicle_transform_from_points(world, actor.spawn_point, _timed_path_heading_point(actor) if actor.placement_mode == "timed_path" else actor.destination_point, spawn_yaw=getattr(actor, "spawn_yaw", None))
-                    ]
+                    vehicle_spawn_candidates = _freeform_transform_candidates(
+                        world,
+                        actor.spawn_point,
+                        _timed_path_heading_point(actor) if actor.placement_mode == "timed_path" else actor.destination_point,
+                        getattr(actor, "spawn_yaw", None),
+                        _vehicle_transform_from_points,
+                    )
                 else:
                     vehicle_spawn_candidates = _road_spawn_transform_candidates(
                         world,
@@ -1274,14 +1372,18 @@ def _simulation_worker(
                     blueprint.set_attribute("role_name", role_name)
                 if actor.color and blueprint.has_attribute("color"):
                     blueprint.set_attribute("color", actor.color)
-                vehicle = _try_spawn_vehicle_from_candidates(world, blueprint, vehicle_spawn_candidates)
+                if actor.placement_mode in {"path", "point", "timed_path"} and actor.spawn_point is not None:
+                    vehicle, vehicle_spawn_attempts = _try_spawn_actor_from_candidates_with_attempts(world, blueprint, vehicle_spawn_candidates)
+                else:
+                    vehicle = _try_spawn_vehicle_from_candidates(world, blueprint, vehicle_spawn_candidates)
+                    vehicle_spawn_attempts = []
                 if vehicle is None:
                     if actor.placement_mode in {"path", "point", "timed_path"} and actor.spawn_point is not None:
                         _append_debug_log(
                             debug_log,
-                            f"Spawn failed for {actor.label} at freeform point ({actor.spawn_point.x:.2f}, {actor.spawn_point.y:.2f}).",
+                            f"Spawn failed for {actor.label} near freeform point ({actor.spawn_point.x:.2f}, {actor.spawn_point.y:.2f}) after {len(vehicle_spawn_candidates)} attempts.",
                         )
-                        logger.warning(f"Skipping vehicle {actor.label} — failed to spawn at ({actor.spawn_point.x}, {actor.spawn_point.y})")
+                        logger.warning(f"Skipping vehicle {actor.label} — failed to spawn near ({actor.spawn_point.x}, {actor.spawn_point.y}) after {len(vehicle_spawn_candidates)} attempts")
                         _put_message(
                             message_queue,
                             {
@@ -1290,7 +1392,8 @@ def _simulation_worker(
                                     "frame": 0,
                                     "timestamp": 0.0,
                                     "actors": [],
-                                    "warning": f"Could not place {actor.label} at ({actor.spawn_point.x:.1f}, {actor.spawn_point.y:.1f}) — skipped",
+                                    "warning": f"Could not place {actor.label} near ({actor.spawn_point.x:.1f}, {actor.spawn_point.y:.1f}) after {len(vehicle_spawn_candidates)} attempts — skipped",
+                                    "spawn_attempts": [_spawn_attempt_summary(actor, vehicle_spawn_attempts)],
                                 },
                             },
                         )
@@ -1441,8 +1544,15 @@ def _simulation_worker(
                 else:
                     _set_vehicle_autopilot(vehicle, False, settings["tm_port"])
             elif actor.kind == "walker":
+                walker_spawn_candidates: list[Any] | None = None
                 if actor.placement_mode in {"path", "point", "timed_path"} and actor.spawn_point is not None:
-                    transform = _walker_transform_from_points(world, actor.spawn_point, _timed_path_heading_point(actor) if actor.placement_mode == "timed_path" else actor.destination_point, spawn_yaw=getattr(actor, "spawn_yaw", None))
+                    walker_spawn_candidates = _freeform_transform_candidates(
+                        world,
+                        actor.spawn_point,
+                        _timed_path_heading_point(actor) if actor.placement_mode == "timed_path" else actor.destination_point,
+                        getattr(actor, "spawn_yaw", None),
+                        _walker_transform_from_points,
+                    )
                 else:
                     anchor = _resolve_anchor(
                         waypoint_index,
@@ -1461,14 +1571,16 @@ def _simulation_worker(
                             and str(getattr(actor, "lane_facing", "with_lane")) == "against_lane"
                         ),
                     )
+                    walker_spawn_candidates = [transform]
                 blueprints = blueprint_library.filter(actor.blueprint)
                 if not blueprints:
                     blueprints = blueprint_library.filter("walker.pedestrian.*")
                 blueprint = blueprints[0]
-                walker = world.try_spawn_actor(blueprint, transform)
+                walker, walker_spawn_attempts = _try_spawn_actor_from_candidates_with_attempts(world, blueprint, walker_spawn_candidates or [])
                 if walker is None:
                     if actor.placement_mode in {"path", "point", "timed_path"} and actor.spawn_point is not None:
-                        warn_msg = f"Skipped walker {actor.label}: spawn failed at freeform point ({actor.spawn_point.x:.2f}, {actor.spawn_point.y:.2f})."
+                        attempts = len(walker_spawn_candidates or [])
+                        warn_msg = f"Skipped walker {actor.label}: spawn failed near freeform point ({actor.spawn_point.x:.2f}, {actor.spawn_point.y:.2f}) after {attempts} attempts."
                     else:
                         warn_msg = (
                             f"Skipped walker {actor.label}: spawn failed on road={actor.spawn.road_id} "
@@ -1556,10 +1668,9 @@ def _simulation_worker(
                         _append_debug_log(debug_log, f"Path placement for {actor.label}: {len(distributed)} copies along {len(actor.path_placement)} points, spacing={actor.path_spacing}m")
                     continue
                 # Static props - spawn at freeform point or road anchor
+                prop_spawn_candidates: list[Any]
                 if actor.spawn_point:
-                    loc = carla.Location(x=actor.spawn_point.x, y=-actor.spawn_point.y, z=0.05)
-                    prop_yaw = float(getattr(actor, "spawn_yaw", 0) or 0)
-                    transform = carla.Transform(loc, carla.Rotation(yaw=prop_yaw))
+                    prop_spawn_candidates = _prop_transform_candidates(actor.spawn_point, getattr(actor, "spawn_yaw", None))
                 else:
                     anchor = _resolve_anchor(
                         waypoint_index,
@@ -1574,6 +1685,7 @@ def _simulation_worker(
                         continue
                     transform = anchor.transform
                     transform.location.z += 0.05
+                    prop_spawn_candidates = [transform]
 
                 prop_bps = blueprint_library.filter(actor.blueprint)
                 if not prop_bps:
@@ -1581,9 +1693,25 @@ def _simulation_worker(
                     continue
                 prop_bp = prop_bps[0]
 
-                prop_handle = world.try_spawn_actor(prop_bp, transform)
+                prop_handle, prop_spawn_attempts = _try_spawn_actor_from_candidates_with_attempts(world, prop_bp, prop_spawn_candidates)
                 if prop_handle is None:
-                    _append_debug_log(debug_log, f"Prop {actor.label}: spawn failed at {transform.location}, skipping")
+                    if actor.spawn_point:
+                        _append_debug_log(debug_log, f"Prop {actor.label}: spawn failed near ({actor.spawn_point.x:.2f}, {actor.spawn_point.y:.2f}) after {len(prop_spawn_candidates)} attempts, skipping")
+                        _put_message(
+                            message_queue,
+                            {
+                                "kind": "stream",
+                                "payload": {
+                                    "frame": 0,
+                                    "timestamp": 0.0,
+                                    "actors": [],
+                                    "warning": f"Could not place {actor.label} near ({actor.spawn_point.x:.1f}, {actor.spawn_point.y:.1f}) after {len(prop_spawn_candidates)} attempts — skipped",
+                                    "spawn_attempts": [_spawn_attempt_summary(actor, prop_spawn_attempts)],
+                                },
+                            },
+                        )
+                    else:
+                        _append_debug_log(debug_log, f"Prop {actor.label}: spawn failed at {prop_spawn_candidates[0].location}, skipping")
                     continue
 
                 actors.append((actor, prop_handle))
@@ -1592,6 +1720,52 @@ def _simulation_worker(
                     f"Spawned prop {actor.label} blueprint={actor.blueprint} at "
                     f"({transform.location.x}, {transform.location.y}, {transform.location.z})",
                 )
+
+        spawn_positions = []
+        for actor_draft, handle in actors:
+            if handle is None:
+                continue
+            transform = handle.get_transform()
+            location = transform.location
+            rotation = transform.rotation
+            frontend = carla_to_frontend(location, rotation)
+            spawn_positions.append({
+                "actor_id": actor_draft.id,
+                "label": actor_draft.label,
+                "kind": actor_draft.kind,
+                "role": actor_draft.role,
+                "placement_mode": actor_draft.placement_mode,
+                "handle_id": int(handle.id),
+                "frontend": frontend,
+                "carla": {
+                    "x": float(location.x),
+                    "y": float(location.y),
+                    "z": float(location.z),
+                    "yaw": float(rotation.yaw),
+                },
+            })
+        if spawn_positions:
+            _append_debug_log(
+                debug_log,
+                "Spawned actor positions: "
+                + "; ".join(
+                    f"{item['label']} frontend=({item['frontend']['x']:.2f}, {item['frontend']['y']:.2f}, z={item['frontend']['z']:.2f}) carla=({item['carla']['x']:.2f}, {item['carla']['y']:.2f}, z={item['carla']['z']:.2f})"
+                    for item in spawn_positions
+                ),
+            )
+            _put_message(
+                message_queue,
+                {
+                    "kind": "stream",
+                    "payload": {
+                        "frame": 0,
+                        "timestamp": 0.0,
+                        "event_kind": "spawn_positions",
+                        "actors": [],
+                        "spawn_positions": spawn_positions,
+                    },
+                },
+            )
 
         if request.topdown_recording:
             sensor_bp = blueprint_library.find("sensor.camera.rgb")
@@ -2066,7 +2240,6 @@ def _simulation_worker(
                             frame=frame,
                             timestamp=step * request.fixed_delta_seconds,
                             actors=[SimulationActorState.model_validate(item) for item in actor_states],
-                            frame_jpeg=None,
                             event_kind="simulation_tick",
                         ).model_dump(),
                         "phase": "simulating",

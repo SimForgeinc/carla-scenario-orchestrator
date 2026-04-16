@@ -1,0 +1,28 @@
+FROM carlasim/carla:0.9.16-vwpoc AS donor
+
+FROM carlasim/carla:0.9.16
+
+USER root
+
+COPY --from=donor /workspace/CarlaUE4/Plugins/RoadRunnerMaterials/ /workspace/CarlaUE4/Plugins/RoadRunnerMaterials/
+COPY --from=donor /workspace/CarlaUE4/Plugins/RoadRunnerCarlaContent/ /workspace/CarlaUE4/Plugins/RoadRunnerCarlaContent/
+
+COPY BelmontOfficePark_2605780e1-dirty.tar.gz /tmp/belmont.tar.gz
+COPY RichmondFieldStation_2605780e1-dirty.tar.gz /tmp/richmond.tar.gz
+COPY SaratogaSchoolArea_2605780e1-dirty.tar.gz /tmp/saratoga.tar.gz
+COPY YaleStPaloAltoCA_2605780e1-dirty.tar.gz /tmp/yale.tar.gz
+
+COPY Richmond_Field_Station_Richmond_CA.xodr /tmp/Richmond_Field_Station_Richmond_CA.xodr
+COPY Yale_St_Palo_Alto_CA.xodr /tmp/Yale_St_Palo_Alto_CA.xodr
+
+RUN cd /workspace && \
+    tar xzf /tmp/belmont.tar.gz && \
+    tar xzf /tmp/richmond.tar.gz && \
+    tar xzf /tmp/saratoga.tar.gz && \
+    tar xzf /tmp/yale.tar.gz && \
+    rm /tmp/belmont.tar.gz /tmp/richmond.tar.gz /tmp/saratoga.tar.gz /tmp/yale.tar.gz && \
+    cp /tmp/Richmond_Field_Station_Richmond_CA.xodr /tmp/Yale_St_Palo_Alto_CA.xodr \
+       /workspace/CarlaUE4/Content/Carla/Maps/OpenDrive/ && \
+    rm /tmp/Richmond_Field_Station_Richmond_CA.xodr /tmp/Yale_St_Palo_Alto_CA.xodr
+
+USER carla

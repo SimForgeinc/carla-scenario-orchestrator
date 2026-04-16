@@ -20,7 +20,7 @@ def get_workspace_for_scenario(scenario_id: str) -> str | None:
     """Look up the workspace_id for a scenario from Aurora."""
     try:
         rows = query_rows(
-            "SELECT workspace_id FROM scenarios WHERE id = :id OR legacy_run_id = :id LIMIT 1",
+            "SELECT workspace_id FROM scenarios WHERE id = :id LIMIT 1",
             [param("id", scenario_id)],
         )
         if rows:
@@ -53,12 +53,12 @@ def create_simulation(
     try:
         execute(
             """INSERT INTO simulations
-                (id, workspace_id, scenario_id, scenario_legacy_id,
+(id, workspace_id, scenario_id,
                  orchestrator_job_id, status, map_name,
                  orchestrator_base_url, request_payload,
                  created_by_user_id, created_at, updated_at)
             VALUES
-                (:id, :workspace_id, :scenario_id, :scenario_legacy_id,
+(:id, :workspace_id, :scenario_id,
                  :orchestrator_job_id, :status, :map_name,
                  :orchestrator_base_url, :request_payload,
                  :created_by_user_id, :created_at::timestamptz, :updated_at::timestamptz)""",
@@ -66,7 +66,6 @@ def create_simulation(
                 param("id", sim_id),
                 param("workspace_id", workspace_id),
                 param("scenario_id", scenario_id),
-                param("scenario_legacy_id", scenario_id),
                 param("orchestrator_job_id", orchestrator_job_id),
                 param("status", "running"),
                 param("map_name", map_name),
@@ -139,11 +138,11 @@ def create_artifact(
     try:
         execute(
             """INSERT INTO simulation_artifacts
-                (id, workspace_id, scenario_legacy_id, scenario_id, simulation_id,
+(id, workspace_id, scenario_id, simulation_id,
                  kind, label, content_type, file_ext, size_bytes, checksum_sha256,
                  s3_bucket, s3_key, created_by_user_id, created_at)
             VALUES
-                (:id, :workspace_id, :scenario_legacy_id, :scenario_id, :simulation_id,
+(:id, :workspace_id, :scenario_id, :simulation_id,
                  :kind, :label, :content_type, :file_ext, :size_bytes, :checksum_sha256,
                  :s3_bucket, :s3_key, :created_by_user_id, :created_at::timestamptz)
             ON CONFLICT (workspace_id, scenario_id, s3_key)
@@ -158,7 +157,6 @@ def create_artifact(
             [
                 param("id", artifact_id),
                 param("workspace_id", workspace_id),
-                param("scenario_legacy_id", scenario_id),
                 param("scenario_id", scenario_id),
                 param("simulation_id", simulation_id),
                 param("kind", kind),

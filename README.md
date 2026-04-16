@@ -65,7 +65,6 @@ orchestrator/               Python backend
     simulation_service.py   Core simulation loop
     models.py               Request/response models
     dataset_repository.py   Map metadata
-  llm/                      Bedrock scenario generation
 monitor/                    Svelte ops dashboard
 scripts/                    Benchmark and utility scripts
 tests/                      Unit tests (27 tests)
@@ -126,11 +125,10 @@ Temporal UI: `8080`
 - `POST /api/jobs/{id}/events` — internal: workers push events
 - `GET /metrics` — Prometheus metrics
 
-### LLM
-- `POST /api/llm/generate` — Bedrock scenario generation
-- `POST /api/llm/scene-assistant` — scene assistant chat
 
 ## Environment
+
+The orchestrator now supports a best-effort SSM bootstrap using `SIMFORGE_ENV` (`dev` or `prod`). It still falls back to `.env`, `EnvironmentFile`, and systemd-provided host exceptions when SSM access is unavailable.
 
 Key variables (see `.env.example`):
 

@@ -51,7 +51,7 @@ TimelineAction = Literal[
 
 
 class ActorTimelineClip(BaseModel):
-    id: str
+    id: str = Field(default_factory=lambda: str(__import__("uuid").uuid4()))
     start_time: float = Field(default=0.0, ge=0.0, le=TIMELINE_DURATION_LIMIT_SECONDS)
     end_time: float | None = Field(default=None, ge=0.0, le=TIMELINE_DURATION_LIMIT_SECONDS)
     action: TimelineAction
@@ -87,65 +87,24 @@ class ActorDraft(BaseModel):
     timeline: list[ActorTimelineClip] = Field(default_factory=list)
 
 
-class LLMGenerateRequest(BaseModel):
-    map_name: str
-    selected_roads: list[SelectedRoad] = Field(default_factory=list)
-    prompt: str = Field(min_length=1, max_length=6000)
-    max_actors: int = Field(default=6, ge=1, le=12)
-
-
-class LLMGenerateResponse(BaseModel):
-    model: str
-    summary: str
-    actors: list[ActorDraft]
-    raw_json: dict[str, Any]
-
-
-class SceneAssistantMessage(BaseModel):
-    role: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=6000)
-
-
-class SceneAssistantToolTrace(BaseModel):
-    name: str
-    input: dict[str, Any] = Field(default_factory=dict)
-    result: dict[str, Any] = Field(default_factory=dict)
-
-
-class SceneAssistantRequest(BaseModel):
-    map_name: str
-    selected_roads: list[SelectedRoad] = Field(default_factory=list)
-    runtime_map: "RuntimeMapResponse"
-    actors: list[ActorDraft] = Field(default_factory=list)
-    live_actors: list["SimulationActorState"] = Field(default_factory=list)
-    selected_actor_id: str | None = None
-    messages: list[SceneAssistantMessage] = Field(default_factory=list, min_length=1)
-
-
-class SceneAssistantResponse(BaseModel):
-    model: str
-    reply: str
-    map_name: str
-    normalized_map_name: str
-    actors: list[ActorDraft] = Field(default_factory=list)
-    selected_roads: list[SelectedRoad] = Field(default_factory=list)
-    selected_actor_id: str | None = None
-    tool_trace: list[SceneAssistantToolTrace] = Field(default_factory=list)
-    raw_response: dict[str, Any] = Field(default_factory=dict)
-
-
 class SimulationRunRequest(BaseModel):
-    source_run_id: str | None = None
+    scenario_id: str | None = None
     map_name: str
     selected_roads: list[SelectedRoad] = Field(default_factory=list)
     actors: list[ActorDraft] = Field(default_factory=list)
-    duration_seconds: float = Field(default=TIMELINE_DURATION_LIMIT_SECONDS, ge=1.0, le=TIMELINE_DURATION_LIMIT_SECONDS)
+    duration_seconds: float = Field(default=TIMELINE_DURATION_LIMIT_SECONDS, ge=0.01, le=TIMELINE_DURATION_LIMIT_SECONDS)
     fixed_delta_seconds: float = Field(default=0.05, ge=0.01, le=0.2)
     topdown_recording: bool = True
     recording_width: int = Field(default=1280, ge=320, le=3840)
     recording_height: int = Field(default=720, ge=240, le=2160)
     recording_fov: float = Field(default=90.0, ge=30.0, le=140.0)
     sensors: list[SensorConfig] = Field(default_factory=list)
+    gt_sensors: list[str] = Field(default_factory=list)  # e.g. ["semantic_seg", "depth", "instance_seg"]
+    workspace_id: str | None = None
+    submitted_by_agent_id: str | None = None
+    test_run: bool = False
+    artifact_ttl_hours: int | None = None
+    priority: Literal["interactive", "batch"] = "interactive"
 
 
 class RecordingInfo(BaseModel):
@@ -154,7 +113,7 @@ class RecordingInfo(BaseModel):
     mp4_path: str | None = None
     frames_path: str | None = None
     created_at: str
-    source_run_id: str | None = None
+    scenario_id: str | None = None
     s3_url: str | None = None
 
 
@@ -162,13 +121,8 @@ class SimulationRunDiagnostics(BaseModel):
     run_id: str
     map_name: str
     created_at: str
-    source_run_id: str | None = None
+    scenario_id: str | None = None
     s3_url: str | None = None
-    selected_roads: list[SelectedRoad] = Field(default_factory=list)
-    actors: list[ActorDraft] = Field(default_factory=list)
-    recording_path: str | None = None
-    scenario_log_path: str | None = None
-    debug_log_path: str | None = None
     worker_error: str | None = None
     saved_frame_count: int = 0
     sensor_timeout_count: int = 0
@@ -268,8 +222,8 @@ class SimulationStreamMessage(BaseModel):
     actors: list[SimulationActorState] = Field(default_factory=list)
     simulation_ended: bool = False
     error: str | None = None
+    warning: str | None = None
     recording: RecordingInfo | None = None
-    frame_jpeg: str | None = None
 
 
 # ── Sensor Configuration (multi-sensor support) ──
@@ -284,15 +238,20 @@ class SensorPose(BaseModel):
 
 
 class SensorConfig(BaseModel):
-    """Individual sensor configuration sent from the frontend."""
+    """Unified sensor configuration. Single flat type for all sensor categories.
+    World sensors use attach_to='world' with pose as world position.
+    Ego sensors use attach_to='ego' with pose as offset from vehicle."""
     id: str
-    label: str
+    label: str = ""
     sensor_category: Literal["camera", "lidar", "radar", "imu", "gnss"] = "camera"
-    output_modality: str = "rgb"
+    output_modality: Literal[
+        "rgb", "depth", "semantic_segmentation", "instance_segmentation",
+        "point_cloud", "semantic_point_cloud", "radar_data", "imu_data", "gnss_fix",
+    ] = "rgb"
     attachment_type: Literal["rigid", "spring_arm", "spring_arm_ghost"] = "rigid"
     pose: SensorPose = Field(default_factory=SensorPose)
     update_rate: float = Field(default=30.0, ge=0.0, le=60.0)
-    attach_to: str = "ego"  # actor ID or "world"
+    attach_to: str = "ego"
 
     # Camera-specific
     width: int = Field(default=1920, ge=320, le=3840)
@@ -301,7 +260,7 @@ class SensorConfig(BaseModel):
 
     # LiDAR-specific
     channels: int = Field(default=64, ge=1, le=128)
-    range_m: float = Field(default=100.0, ge=1.0, le=200.0)
+    range: float = Field(default=100.0, ge=1.0, le=200.0)
     points_per_second: int = Field(default=1_200_000, ge=100)
     rotation_frequency: float = Field(default=20.0, ge=1.0, le=60.0)
 
@@ -310,6 +269,5 @@ class SensorConfig(BaseModel):
     vertical_fov: float = Field(default=30.0, ge=1.0, le=179.0)
     radar_range: float = Field(default=100.0, ge=1.0, le=300.0)
 
-    # World-placed cameras
-    world_position: ActorMapPoint | None = None
-    world_rotation: SensorPose | None = None
+    # Tracking (world sensors that follow a named actor)
+    tracking_target: str | None = None
