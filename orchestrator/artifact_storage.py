@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import mimetypes
@@ -130,8 +131,11 @@ class S3ArtifactStorage:
             if isinstance(sensor, dict) and sensor.get("id")
         }
         gt_sensor_names = [str(name) for name in request_payload.get("gt_sensors", []) if isinstance(name, str)]
+        output_spec = request_payload.get("output_spec") if isinstance(request_payload.get("output_spec"), dict) else {}
+        playback_only = str(output_spec.get("profile") or "").strip().lower() == "playback"
 
-        self._ensure_calibration_files(run_dir, sensor_configs, gt_sensor_names)
+        if not playback_only:
+            self._ensure_calibration_files(run_dir, sensor_configs, gt_sensor_names)
         self._ensure_gt_index_file(run_dir, job, prefix)
 
         def upload_file(
@@ -240,46 +244,43 @@ class S3ArtifactStorage:
             },
         ]
 
+        pending: list[dict] = []
         for spec in base_specs:
             path = spec["path"]
             if not path or not path.is_file():
                 continue
-            uploaded.append(
-                upload_file(
-                    path=path,
-                    key=spec["key"],
-                    kind=spec["kind"],
-                    artifact_class=spec["artifact_class"],
-                    output_modality=spec["output_modality"],
-                    artifact_format=spec["artifact_format"],
-                    is_raw=spec["is_raw"],
-                    content_type=spec["content_type"],
-                )
-            )
+            pending.append(dict(
+                path=path,
+                key=spec["key"],
+                kind=spec["kind"],
+                artifact_class=spec["artifact_class"],
+                output_modality=spec["output_modality"],
+                artifact_format=spec["artifact_format"],
+                is_raw=spec["is_raw"],
+                content_type=spec["content_type"],
+            ))
 
         calibration_dir = run_dir / "calibration"
-        if calibration_dir.is_dir():
+        if not playback_only and calibration_dir.is_dir():
             for calibration_file in sorted(calibration_dir.rglob("*.json")):
                 sensor_id = calibration_file.parent.name
                 sensor_cfg = sensor_configs.get(sensor_id)
-                uploaded.append(
-                    upload_file(
-                        path=calibration_file,
-                        key=f"{prefix}/calibration/{sensor_id}/{calibration_file.name}",
-                        kind="calibration",
-                        artifact_class="calibration",
-                        sensor_id=sensor_id,
-                        sensor_label=(sensor_cfg or {}).get("label") if sensor_cfg else sensor_id,
-                        sensor_category=(sensor_cfg or {}).get("sensor_category")
-                        if sensor_cfg
-                        else ("camera" if sensor_id.startswith("gt-") else None),
-                        output_modality=(sensor_cfg or {}).get("output_modality") if sensor_cfg else None,
-                        artifact_format="json",
-                        sequence_id=sensor_id,
-                        is_raw=True,
-                        content_type="application/json",
-                    )
-                )
+                pending.append(dict(
+                    path=calibration_file,
+                    key=f"{prefix}/calibration/{sensor_id}/{calibration_file.name}",
+                    kind="calibration",
+                    artifact_class="calibration",
+                    sensor_id=sensor_id,
+                    sensor_label=(sensor_cfg or {}).get("label") if sensor_cfg else sensor_id,
+                    sensor_category=(sensor_cfg or {}).get("sensor_category")
+                    if sensor_cfg
+                    else ("camera" if sensor_id.startswith("gt-") else None),
+                    output_modality=(sensor_cfg or {}).get("output_modality") if sensor_cfg else None,
+                    artifact_format="json",
+                    sequence_id=sensor_id,
+                    is_raw=True,
+                    content_type="application/json",
+                ))
 
         sensors_dir = run_dir / "sensors"
         if sensors_dir.is_dir():
@@ -297,63 +298,60 @@ class S3ArtifactStorage:
                     frame_index = _frame_index_from_path(file_path)
                     suffix = _file_ext(file_path)
                     if file_path.name == "recording.mp4":
-                        uploaded.append(
-                            upload_file(
-                                path=file_path,
-                                key=f"{prefix}/sensors/{sensor_id}/recording/recording.mp4",
-                                kind="recording",
-                                artifact_class="recording",
-                                sensor_id=sensor_id,
-                                sensor_label=sensor_label,
-                                sensor_category=sensor_category,
-                                output_modality=output_modality,
-                                artifact_format="mp4",
-                                sequence_id=sensor_id,
-                                is_raw=False,
-                                content_type="video/mp4",
-                            )
-                        )
-                        continue
-
-                    modality_segment = output_modality or (suffix or "artifact")
-                    uploaded.append(
-                        upload_file(
+                        pending.append(dict(
                             path=file_path,
-                            key=f"{prefix}/sensors/{sensor_id}/{modality_segment}/{file_path.name}",
-                            kind=output_modality or suffix or "artifact",
-                            artifact_class="raw_sensor_output",
+                            key=f"{prefix}/sensors/{sensor_id}/recording/recording.mp4",
+                            kind="recording",
+                            artifact_class="recording",
                             sensor_id=sensor_id,
                             sensor_label=sensor_label,
                             sensor_category=sensor_category,
                             output_modality=output_modality,
-                            artifact_format=suffix,
-                            frame_index=frame_index,
+                            artifact_format="mp4",
                             sequence_id=sensor_id,
-                            is_raw=True,
-                        )
-                    )
+                            is_raw=False,
+                            content_type="video/mp4",
+                        ))
+                        continue
+
+                    if playback_only:
+                        continue
+
+                    modality_segment = output_modality or (suffix or "artifact")
+                    pending.append(dict(
+                        path=file_path,
+                        key=f"{prefix}/sensors/{sensor_id}/{modality_segment}/{file_path.name}",
+                        kind=output_modality or suffix or "artifact",
+                        artifact_class="raw_sensor_output",
+                        sensor_id=sensor_id,
+                        sensor_label=sensor_label,
+                        sensor_category=sensor_category,
+                        output_modality=output_modality,
+                        artifact_format=suffix,
+                        frame_index=frame_index,
+                        sequence_id=sensor_id,
+                        is_raw=True,
+                    ))
 
         gt_dir = run_dir / "gt"
-        if gt_dir.is_dir():
+        if not playback_only and gt_dir.is_dir():
             for gt_subdir in sorted(gt_dir.iterdir()):
                 if not gt_subdir.is_dir():
                     continue
                 gt_name = gt_subdir.name
                 if gt_name == "scene":
                     for file_path in sorted(gt_subdir.glob("*.json")):
-                        uploaded.append(
-                            upload_file(
-                                path=file_path,
-                                key=f"{prefix}/gt/scene/{file_path.name}",
-                                kind="gt_index",
-                                artifact_class="ground_truth_index",
-                                output_modality="gt_index",
-                                artifact_format="json",
-                                sequence_id="gt-scene",
-                                is_raw=True,
-                                content_type="application/json",
-                            )
-                        )
+                        pending.append(dict(
+                            path=file_path,
+                            key=f"{prefix}/gt/scene/{file_path.name}",
+                            kind="gt_index",
+                            artifact_class="ground_truth_index",
+                            output_modality="gt_index",
+                            artifact_format="json",
+                            sequence_id="gt-scene",
+                            is_raw=True,
+                            content_type="application/json",
+                        ))
                     continue
                 sensor_id = f"gt-{gt_name}"
                 sensor_label = GT_SENSOR_LABELS.get(gt_name, sensor_id)
@@ -370,22 +368,40 @@ class S3ArtifactStorage:
                         key = f"{prefix}/gt/{gt_name}/{file_path.name}"
                         kind = f"gt_{gt_name}"
                         modality = output_modality
-                    uploaded.append(
-                        upload_file(
-                            path=file_path,
-                            key=key,
-                            kind=kind,
-                            artifact_class="ground_truth",
-                            sensor_id=sensor_id,
-                            sensor_label=sensor_label,
-                            sensor_category="camera",
-                            output_modality=modality,
-                            artifact_format=_file_ext(file_path),
-                            frame_index=frame_index,
-                            sequence_id=sensor_id,
-                            is_raw=True,
-                        )
-                    )
+                    pending.append(dict(
+                        path=file_path,
+                        key=key,
+                        kind=kind,
+                        artifact_class="ground_truth",
+                        sensor_id=sensor_id,
+                        sensor_label=sensor_label,
+                        sensor_category="camera",
+                        output_modality=modality,
+                        artifact_format=_file_ext(file_path),
+                        frame_index=frame_index,
+                        sequence_id=sensor_id,
+                        is_raw=True,
+                    ))
+
+        # Dispatch all uploads concurrently, preserving insertion order.
+        # Partial failures are collected and re-raised after all futures settle.
+        errors: list[tuple[str, BaseException]] = []
+        if pending:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {pool.submit(upload_file, **spec): spec["key"] for spec in pending}
+                results_by_key: dict[str, StoredArtifact] = {}
+                for future in concurrent.futures.as_completed(futures):
+                    key = futures[future]
+                    try:
+                        results_by_key[key] = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append((key, exc))
+            for spec in pending:
+                if spec["key"] in results_by_key:
+                    uploaded.append(results_by_key[spec["key"]])
+        if errors:
+            summary = "; ".join(f"{k}: {e}" for k, e in errors)
+            raise RuntimeError(f"{len(errors)} artifact upload(s) failed: {summary}")
 
         return uploaded
 
